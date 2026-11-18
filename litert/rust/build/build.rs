@@ -39,7 +39,7 @@ macro_rules! litert_sdk_version {
 }
 
 const LITERT_RUNTIME_DOWNLOAD_URL: &str =
-    concat!("https://storage.googleapis.com/litert/binaries/", litert_sdk_version!(), "/");
+    concat!("http://127.0.0.1:8080/litert/binaries/", litert_sdk_version!(), "/");
 const LITERT_CC_SDK_DOWNLOAD_URL: &str = concat!(
     "https://github.com/google-ai-edge/LiteRT/releases/download/v",
     litert_sdk_version!(),
@@ -348,7 +348,7 @@ fn download_and_build_cpp_sdk(
         return Err(format!("CMake configure failed with status: {}", status).into());
     }
 
-    let status = Command::new("cmake").arg("--build").arg(&build_dir).arg("-j").status()?;
+    let status = Command::new("cmake").arg("--build").arg(&build_dir).arg("-j2").status()?;
 
     if !status.success() {
         return Err(format!("CMake build failed with status: {}", status).into());
