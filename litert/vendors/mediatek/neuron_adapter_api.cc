@@ -15,6 +15,9 @@
 #include "litert/vendors/mediatek/neuron_adapter_api.h"
 
 #include <dlfcn.h>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 
 #include <cstdint>
 #include <memory>
@@ -24,13 +27,15 @@
 #include <vector>
 
 #include "absl/strings/str_cat.h"  // from @com_google_absl
+#if defined(__ANDROID__)
+#include "absl/strings/string_view.h"  // from @com_google_absl
+#endif
 #include "litert/c/internal/litert_logging.h"
 #include "litert/c/litert_common.h"
 #include "litert/c/options/litert_mediatek_options.h"
 #include "litert/cc/internal/litert_shared_library.h"
 #include "litert/cc/litert_expected.h"
 #include "litert/cc/litert_macros.h"
-#include "neuron/api/NeuronAdapter.h"
 
 #ifndef LITERT_NEURO_PILOT_V7_HOST_LIB_DIR
 #define LITERT_NEURO_PILOT_V7_HOST_LIB_DIR \
@@ -58,6 +63,25 @@
 
 namespace litert {
 namespace mediatek {
+namespace {
+
+#if defined(__ANDROID__)
+// TODO(b/587166891): Remove this temporary workaround once callers
+// explicitly select NeuroPilot 9 via `MediatekOptions::NeronSDKVersion`.
+// Returns true if `ro.soc.model` identifies a MediaTek SoC that
+// ships NeuroPilot 9 on the platform even when
+// `NeuronService_getNeuroPilotMagicNumber` returns `< 0` (e.g. MT8196/MT8196P).
+bool IsCurrentDeviceNeuroPilot9Platform() {
+  char raw_soc[PROP_VALUE_MAX] = {};
+  if (__system_property_get("ro.soc.model", raw_soc) > 0) {
+    absl::string_view soc(raw_soc);
+    return soc == "Dimensity CX C10 Max";
+  }
+  return false;
+}
+#endif
+
+}  // namespace
 
 NeuronAdapterApi::NeuronAdapterApi() : api_(new Api) {}
 
@@ -134,23 +158,31 @@ litert::Expected<void> NeuronAdapterApi::LoadSymbols(
   }
   so_paths.push_back(absl::StrCat(sdk_path, "/", kLibNeuronAdapterLib));
 #else
-  (void)sdk_version;
-  so_paths.push_back("libneuron_adapter_mgvi.so");
+  // Check if user options request a specific version of usdk.
+  if (sdk_version == kLiteRtMediatekOptionsNeronSDKVersionTypeVersion9) {
+    so_paths.push_back("libneuronusdk_adapter.9.mtk.so");
+  }
+
+  // User-installed usdk.
+  so_paths.push_back("libneuronusdk_adapter.so");
 
   // Add preinstalled libraries for system partition applications.
-  // Check if the device need to use higher version of usdk.
+  // Check if the device needs to use higher version of usdk.
   auto magic_number = GetNeuroPilotMagicNumber();
   if (magic_number && magic_number.Value() >= kMinMagicNumberForNP10) {
     so_paths.push_back("libneuronusdk_adapter.10.mtk.so");
   } else if (magic_number &&
              magic_number.Value() >= kMinMagicNumberForNeuronService) {
     so_paths.push_back("libneuronusdk_adapter.9.mtk.so");
+  } else if (IsCurrentDeviceNeuroPilot9Platform()) {
+    so_paths.push_back("libneuronusdk_adapter.9.mtk.so");
+    so_paths.push_back("libneuronusdk_adapter.mtk.so");
   } else {
+    so_paths.push_back("libneuronusdk_adapter.8.mtk.so");
     so_paths.push_back("libneuronusdk_adapter.mtk.so");
   }
 
-  // User-installed usdk
-  so_paths.push_back("libneuronusdk_adapter.so");
+  so_paths.push_back("libneuron_adapter_mgvi.so");
 
   // Some platforms have non-usdk non-mgvi build
   so_paths.push_back(kLibNeuronAdapterLib);

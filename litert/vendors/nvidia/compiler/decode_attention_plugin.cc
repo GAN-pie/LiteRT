@@ -65,7 +65,10 @@ constexpr char kKeyZeroField[] = "k_zero_point";
 constexpr char kValueScaleField[] = "v_scale";
 constexpr char kValueZeroField[] = "v_zero_point";
 constexpr char kWindowField[] = "window";
-constexpr int kNumFields = 8;
+// Not 0: the rows are this many tokens of rows / row_tokens query heads, run
+// 16 rows at a time on the tensor-core kernel with shared cache reads.
+constexpr char kRowTokensField[] = "row_tokens";
+constexpr int kNumFields = 9;
 constexpr int32_t kMaxRows = 16;
 
 // q, k, v and mask, then k_new and v_new; with a window its start instead.
@@ -87,6 +90,36 @@ bool UsesGlobalKernel(const nvinfer1::Dims& q, const nvinfer1::Dims& mask) {
          LiteRtNvidiaGlobalAttentionSupports(static_cast<int32_t>(q.d[2]),
                                              static_cast<int32_t>(mask.d[2]),
                                              static_cast<int32_t>(q.d[3]));
+}
+
+// Many query rows of a multi-head cache whose keys already hold the chunk
+// (Qwen 3.5's prefill attends to its updated caches): the tiled tensor-core
+// kernel over the whole cache with no separate new keys (tiled_attention.h).
+LiteRtNvidiaAttentionShape CacheOnlyShape(const nvinfer1::Dims& q,
+                                          const nvinfer1::Dims& k,
+                                          const nvinfer1::Dims& mask) {
+  return {static_cast<int32_t>(q.d[1]),    static_cast<int32_t>(q.d[2]),
+          static_cast<int32_t>(mask.d[2]), static_cast<int32_t>(q.d[3]),
+          static_cast<int32_t>(k.d[2]),    0};
+}
+
+bool UsesTiledCacheKernel(const nvinfer1::Dims& q, const nvinfer1::Dims& k,
+                          const nvinfer1::Dims& mask) {
+  if (q.d[2] <= kMaxRows) return false;
+  const LiteRtNvidiaAttentionShape shape = CacheOnlyShape(q, k, mask);
+  return LiteRtNvidiaTiledAttentionSupports(&shape);
+}
+
+// Many query rows over INT8 caches of depth 512 that already hold the chunk
+// (the prefill of Gemma 4 E2B and E4B through their global layers): the tiled
+// tensor-core kernel reads the quantized keys and the value columns as they
+// are stored (tiled_attention.h).
+bool UsesTiledInt8Kernel(int32_t int8_cache, int32_t window,
+                         const nvinfer1::Dims& q, const nvinfer1::Dims& k,
+                         const nvinfer1::Dims& mask) {
+  if (int8_cache != 2 || window != 0 || q.d[2] <= kMaxRows) return false;
+  const LiteRtNvidiaAttentionShape shape = CacheOnlyShape(q, k, mask);
+  return LiteRtNvidiaTiledAttentionInt8Supports(&shape);
 }
 
 bool ValidDimensions(const nvinfer1::Dims& dims) {
@@ -119,11 +152,12 @@ nvinfer1::DataType CacheType(int32_t int8_cache) {
 
 bool ValidDescriptors(const nvinfer1::PluginTensorDesc* inputs,
                       const nvinfer1::PluginTensorDesc* output, bool new_keys,
-                      int32_t int8_cache, int32_t window) {
+                      int32_t int8_cache, int32_t window, int32_t row_tokens) {
   if (inputs == nullptr || output == nullptr ||
       !ValidDimensions(output->dims) ||
       output->format != nvinfer1::TensorFormat::kLINEAR ||
-      (window != 0 && (new_keys || int8_cache == 0))) {
+      (window != 0 && (new_keys || int8_cache == 0)) ||
+      (row_tokens != 0 && (new_keys || int8_cache != 0))) {
     return false;
   }
   const int num_inputs = NumInputs(new_keys, window);
@@ -177,9 +211,21 @@ bool ValidDescriptors(const nvinfer1::PluginTensorDesc* inputs,
       mask.d[0] != 1 || mask.d[1] != 1) {
     return false;
   }
+  if (row_tokens != 0) {
+    return mask.d[3] == k.d[2] &&
+           LiteRtNvidiaGlobalAttentionTokensSupports(
+               static_cast<int32_t>(q.d[2]), row_tokens,
+               static_cast<int32_t>(mask.d[2]), static_cast<int32_t>(q.d[3]));
+  }
   if (int8_cache != 0) {
-    // INT8 caches run only on the decode kernel.
-    return !new_keys && mask.d[3] == k.d[2] && q.d[2] <= kMaxRows &&
+    // INT8 caches run on the decode kernel, or many rows on the tiled one.
+    if (new_keys || mask.d[3] != k.d[2]) {
+      return false;
+    }
+    if (UsesTiledInt8Kernel(int8_cache, window, q, k, mask)) {
+      return true;
+    }
+    return q.d[2] <= kMaxRows &&
            (window == 0 || (window <= k.d[2] && window % 16 == 0)) &&
            LiteRtNvidiaDecodeAttentionInt8Supports(
                static_cast<int32_t>(q.d[3])) &&
@@ -204,7 +250,7 @@ bool ValidDescriptors(const nvinfer1::PluginTensorDesc* inputs,
   if (mask.d[3] != k.d[2]) {
     return false;
   }
-  return UsesGlobalKernel(q, mask) ||
+  return UsesGlobalKernel(q, mask) || UsesTiledCacheKernel(q, k, mask) ||
          (q.d[2] <= kMaxRows && SupportedDepth(q.d[3]) &&
           (mask.d[2] == 1 || mask.d[2] == q.d[2]));
 }
@@ -215,8 +261,8 @@ class DecodeAttentionPlugin final : public nvinfer1::IPluginV3,
                                     public nvinfer1::IPluginV3OneRuntime {
  public:
   DecodeAttentionPlugin(float fill, bool new_keys,
-                        const LiteRtNvidiaInt8CacheParams* int8,
-                        int32_t window) noexcept
+                        const LiteRtNvidiaInt8CacheParams* int8, int32_t window,
+                        int32_t row_tokens) noexcept
       : fill_(fill),
         new_keys_(new_keys ? 1 : 0),
         int8_cache_(int8 == nullptr       ? 0
@@ -227,6 +273,7 @@ class DecodeAttentionPlugin final : public nvinfer1::IPluginV3,
         v_scale_(int8 == nullptr ? 1.0f : int8->v_scale),
         v_zero_(int8 == nullptr ? 0 : int8->v_zero_point),
         window_(window),
+        row_tokens_(row_tokens),
         fields_{
             {{kFillField, &fill_, nvinfer1::PluginFieldType::kFLOAT32, 1},
              {kNewKeysField, &new_keys_, nvinfer1::PluginFieldType::kINT32, 1},
@@ -238,7 +285,9 @@ class DecodeAttentionPlugin final : public nvinfer1::IPluginV3,
              {kValueScaleField, &v_scale_, nvinfer1::PluginFieldType::kFLOAT32,
               1},
              {kValueZeroField, &v_zero_, nvinfer1::PluginFieldType::kINT32, 1},
-             {kWindowField, &window_, nvinfer1::PluginFieldType::kINT32, 1}}},
+             {kWindowField, &window_, nvinfer1::PluginFieldType::kINT32, 1},
+             {kRowTokensField, &row_tokens_, nvinfer1::PluginFieldType::kINT32,
+              1}}},
         field_collection_{static_cast<int32_t>(fields_.size()),
                           fields_.data()} {}
 
@@ -258,7 +307,8 @@ class DecodeAttentionPlugin final : public nvinfer1::IPluginV3,
   nvinfer1::IPluginV3* clone() noexcept override {
     const LiteRtNvidiaInt8CacheParams int8 = Int8Params();
     return new (std::nothrow) DecodeAttentionPlugin(
-        fill_, new_keys_ != 0, int8_cache_ != 0 ? &int8 : nullptr, window_);
+        fill_, new_keys_ != 0, int8_cache_ != 0 ? &int8 : nullptr, window_,
+        row_tokens_);
   }
 
   const char* getPluginName() const noexcept override { return kPluginName; }
@@ -345,7 +395,7 @@ class DecodeAttentionPlugin final : public nvinfer1::IPluginV3,
                         int32_t num_outputs) noexcept override {
     return num_inputs == InputCount() && num_outputs == 1 &&
                    ValidDescriptors(inputs, outputs, new_keys_ != 0,
-                                    int8_cache_, window_)
+                                    int8_cache_, window_, row_tokens_)
                ? 0
                : 1;
   }
@@ -370,11 +420,28 @@ class DecodeAttentionPlugin final : public nvinfer1::IPluginV3,
           NewKeysShape(q, k, inputs[3].max, inputs[4].max);
       return LiteRtNvidiaTiledAttentionWorkspaceBytes(&shape);
     }
+    if (row_tokens_ != 0) {
+      return LiteRtNvidiaGlobalAttentionTokensWorkspaceBytes(
+          static_cast<int32_t>(q.d[2]), row_tokens_,
+          static_cast<int32_t>(inputs[3].max.d[2]),
+          static_cast<int32_t>(k.d[2]), static_cast<int32_t>(q.d[3]));
+    }
+    if (int8_cache_ == 0 && !UsesGlobalKernel(q, inputs[3].max) &&
+        UsesTiledCacheKernel(q, k, inputs[3].max)) {
+      const LiteRtNvidiaAttentionShape shape =
+          CacheOnlyShape(q, k, inputs[3].max);
+      return LiteRtNvidiaTiledAttentionWorkspaceBytes(&shape);
+    }
     if (int8_cache_ == 0 && UsesGlobalKernel(q, inputs[3].max)) {
       return LiteRtNvidiaGlobalAttentionWorkspaceBytes(
           static_cast<int32_t>(q.d[2]),
           static_cast<int32_t>(inputs[3].max.d[2]),
           static_cast<int32_t>(k.d[2]), static_cast<int32_t>(q.d[3]));
+    }
+    if (UsesTiledInt8Kernel(int8_cache_, window_, q, k, inputs[3].max)) {
+      const LiteRtNvidiaAttentionShape shape =
+          CacheOnlyShape(q, k, inputs[3].max);
+      return LiteRtNvidiaTiledAttentionInt8WorkspaceBytes(&shape);
     }
     return LiteRtNvidiaDecodeAttentionWorkspaceBytes(
         static_cast<int32_t>(q.d[1]), static_cast<int32_t>(q.d[2]),
@@ -387,7 +454,7 @@ class DecodeAttentionPlugin final : public nvinfer1::IPluginV3,
                   const void* const* inputs, void* const* outputs,
                   void* workspace, cudaStream_t stream) noexcept override {
     if (!ValidDescriptors(input_desc, output_desc, new_keys_ != 0, int8_cache_,
-                          window_) ||
+                          window_, row_tokens_) ||
         inputs == nullptr || outputs == nullptr || outputs[0] == nullptr ||
         workspace == nullptr) {
       return 1;
@@ -413,6 +480,13 @@ class DecodeAttentionPlugin final : public nvinfer1::IPluginV3,
           &shape, inputs[0], q_bf16, inputs[1], inputs[2], inputs[4], inputs[5],
           static_cast<const bool*>(inputs[3]), fill_, outputs[0], workspace,
           stream);
+    } else if (UsesTiledInt8Kernel(int8_cache_, window_, q, k, mask)) {
+      const LiteRtNvidiaInt8CacheParams int8 = Int8Params();
+      const LiteRtNvidiaAttentionShape shape = CacheOnlyShape(q, k, mask);
+      status = LiteRtNvidiaLaunchTiledAttentionInt8(
+          &shape, inputs[0], q_bf16, inputs[1], inputs[2], &int8,
+          static_cast<const bool*>(inputs[3]), fill_, outputs[0], workspace,
+          stream);
     } else if (int8_cache_ != 0) {
       const LiteRtNvidiaInt8CacheParams int8 = Int8Params();
       status = LiteRtNvidiaLaunchDecodeAttentionInt8Window(
@@ -422,20 +496,37 @@ class DecodeAttentionPlugin final : public nvinfer1::IPluginV3,
           window_ != 0 ? static_cast<const int32_t*>(inputs[4]) : nullptr,
           depth, fill_, outputs[0], workspace, stream);
     } else {
-      if (UsesGlobalKernel(q, mask)) {
+      if (!UsesGlobalKernel(q, mask) && UsesTiledCacheKernel(q, k, mask)) {
+        const LiteRtNvidiaAttentionShape shape = CacheOnlyShape(q, k, mask);
+        status = LiteRtNvidiaLaunchTiledAttention(
+            &shape, inputs[0], q_bf16, inputs[1], inputs[2], nullptr, nullptr,
+            static_cast<const bool*>(inputs[3]), fill_, outputs[0], workspace,
+            stream);
+      } else if (UsesGlobalKernel(q, mask)) {
         // One launch per KV head over that head's rows, keys and values; the
         // mask is shared and the launches run in order on the stream, so
         // they share the workspace.
         const size_t q_head = static_cast<size_t>(rows) * depth * 2;
         const size_t kv_head = static_cast<size_t>(seq) * depth * 2;
         for (int32_t head = 0; head < heads && status == cudaSuccess; ++head) {
-          status = LiteRtNvidiaLaunchGlobalAttention(
-              static_cast<const char*>(inputs[0]) + head * q_head, q_bf16,
-              static_cast<const char*>(inputs[1]) + head * kv_head,
-              static_cast<const char*>(inputs[2]) + head * kv_head,
-              static_cast<const bool*>(inputs[3]), mask_rows, rows, seq, depth,
-              fill_, static_cast<char*>(outputs[0]) + head * q_head, workspace,
-              stream);
+          const void* head_q =
+              static_cast<const char*>(inputs[0]) + head * q_head;
+          const void* head_k =
+              static_cast<const char*>(inputs[1]) + head * kv_head;
+          const void* head_v =
+              static_cast<const char*>(inputs[2]) + head * kv_head;
+          void* head_out = static_cast<char*>(outputs[0]) + head * q_head;
+          status =
+              row_tokens_ != 0
+                  ? LiteRtNvidiaLaunchGlobalAttentionTokens(
+                        head_q, q_bf16, head_k, head_v,
+                        static_cast<const bool*>(inputs[3]), mask_rows,
+                        row_tokens_, rows, seq, depth, fill_, head_out,
+                        workspace, stream)
+                  : LiteRtNvidiaLaunchGlobalAttention(
+                        head_q, q_bf16, head_k, head_v,
+                        static_cast<const bool*>(inputs[3]), mask_rows, rows,
+                        seq, depth, fill_, head_out, workspace, stream);
         }
       } else {
         status = LiteRtNvidiaLaunchDecodeAttention(
@@ -482,6 +573,7 @@ class DecodeAttentionPlugin final : public nvinfer1::IPluginV3,
   float v_scale_;
   int32_t v_zero_;
   int32_t window_;
+  int32_t row_tokens_;
   std::array<nvinfer1::PluginField, kNumFields> fields_;
   nvinfer1::PluginFieldCollection field_collection_;
 };
@@ -499,7 +591,8 @@ class DecodeAttentionPluginCreator final
              {kValueScaleField, nullptr, nvinfer1::PluginFieldType::kFLOAT32,
               1},
              {kValueZeroField, nullptr, nvinfer1::PluginFieldType::kINT32, 1},
-             {kWindowField, nullptr, nvinfer1::PluginFieldType::kINT32, 1}}},
+             {kWindowField, nullptr, nvinfer1::PluginFieldType::kINT32, 1},
+             {kRowTokensField, nullptr, nvinfer1::PluginFieldType::kINT32, 1}}},
         field_collection_{static_cast<int32_t>(fields_.size()),
                           fields_.data()} {}
 
@@ -515,6 +608,7 @@ class DecodeAttentionPluginCreator final
     int32_t new_keys = 0;
     int32_t int8_cache = 0;
     int32_t window = 0;
+    int32_t row_tokens = 0;
     LiteRtNvidiaInt8CacheParams int8 = {1.0f, 0, 1.0f, 0, false};
     for (int32_t i = 0; i < fields->nbFields; ++i) {
       const auto& field = fields->fields[i];
@@ -542,6 +636,8 @@ class DecodeAttentionPluginCreator final
           int8.v_zero_point = value;
         } else if (std::strcmp(field.name, kWindowField) == 0) {
           window = value;
+        } else if (std::strcmp(field.name, kRowTokensField) == 0) {
+          row_tokens = value;
         }
       }
     }
@@ -549,8 +645,9 @@ class DecodeAttentionPluginCreator final
       return nullptr;
     }
     int8.value_columns = int8_cache == 2;
-    return CreateDecodeAttentionPlugin(
-        fill, new_keys != 0, int8_cache != 0 ? &int8 : nullptr, window);
+    return CreateDecodeAttentionPlugin(fill, new_keys != 0,
+                                       int8_cache != 0 ? &int8 : nullptr,
+                                       window, row_tokens);
   }
 
   const nvinfer1::PluginFieldCollection* getFieldNames() noexcept override {
@@ -573,7 +670,7 @@ class DecodeAttentionPluginCreator final
 
 nvinfer1::IPluginV3* CreateDecodeAttentionPlugin(
     float fill, bool new_keys, const LiteRtNvidiaInt8CacheParams* int8_cache,
-    int32_t window) noexcept {
+    int32_t window, int32_t row_tokens) noexcept {
   if (int8_cache != nullptr &&
       (new_keys || !std::isfinite(int8_cache->k_scale) ||
        !std::isfinite(int8_cache->v_scale) || int8_cache->k_scale <= 0.0f ||
@@ -583,8 +680,12 @@ nvinfer1::IPluginV3* CreateDecodeAttentionPlugin(
   if (window < 0 || (window != 0 && (int8_cache == nullptr || window % 16))) {
     return nullptr;
   }
+  if (row_tokens < 0 ||
+      (row_tokens != 0 && (new_keys || int8_cache != nullptr))) {
+    return nullptr;
+  }
   return new (std::nothrow)
-      DecodeAttentionPlugin(fill, new_keys, int8_cache, window);
+      DecodeAttentionPlugin(fill, new_keys, int8_cache, window, row_tokens);
 }
 
 void EnsureDecodeAttentionPluginRegistered() noexcept {}

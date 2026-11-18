@@ -228,6 +228,15 @@ config_setting(
 )
 
 config_setting(
+    name = "windows_arm64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:windows",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
     name = "emscripten",
     constraint_values = ["@platforms//os:emscripten"],
     visibility = ["//visibility:public"],
@@ -376,6 +385,30 @@ config_setting(
 config_setting(
     name = "litert_runtime_link_mode_none",
     values = {"define": "litert_runtime_link_mode=none"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "litert_webgpu_dawn_dynamic_loader_define",
+    define_values = {"litert_webgpu_dawn_dynamic_loader": "true"},
+)
+
+# Dynamically loads WebGPU Dawn (libwebgpu_dawn.so / .dylib / .dll) at runtime
+# via libdawn_proc instead of linking Dawn at build or load time. Evaluates to
+# false on Emscripten (:linux cannot match when :emscripten matches) so select()
+# blocks never hit ambiguous-match errors when combined with :emscripten.
+alias(
+    name = "litert_webgpu_dawn_dynamic_loader",
+    actual = select({
+        ":emscripten": ":linux",
+        "//conditions:default": ":litert_webgpu_dawn_dynamic_loader_define",
+    }),
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "litert_webgpu_dawn_dynamic_loader_disabled",
+    define_values = {"litert_webgpu_dawn_dynamic_loader": "false"},
     visibility = ["//visibility:public"],
 )
 

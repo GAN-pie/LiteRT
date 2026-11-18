@@ -34,15 +34,27 @@
 #include "litert/c/litert_layout.h"
 #include "litert/c/litert_metrics.h"
 #include "litert/c/litert_model_types.h"
+#include "litert/c/litert_op_resolver.h"
 #include "litert/c/litert_opaque_options.h"
 #include "litert/c/litert_opencl_types.h"
 #include "litert/c/litert_tensor_buffer_types.h"
 #include "litert/c/litert_webgpu_types.h"
 #include "litert/cc/litert_api_types.h"
 
+namespace tflite {
+class MutableOpResolver;
+}  // namespace tflite
+
 namespace litert {
+template <typename T>
+class Expected;
 class Environment;
 class Options;
+
+namespace tflite_support {
+Expected<void> SetOpResolver(Options& options,
+                             const tflite::MutableOpResolver* resolver);
+}  // namespace tflite_support
 
 namespace internal {
 
@@ -153,6 +165,8 @@ class RuntimeProxy {
  public:
   friend class litert::Environment;
   friend class litert::Options;
+  friend Expected<void> litert::tflite_support::SetOpResolver(
+      Options& options, const tflite::MutableOpResolver* resolver);
 
   /// @brief Creates a runtime proxy with the externally provided system runtime
   /// handle.
@@ -160,7 +174,11 @@ class RuntimeProxy {
   /// If the system runtime handle is not provided, the builtin runtime will be
   /// used.
   explicit RuntimeProxy(const LiteRtRuntimeCApiStruct* runtime_c_api)
-      : RuntimeProxy(runtime_c_api, ResolveRuntimeAbiVersion(runtime_c_api)) {}
+      : runtime_c_api_(LITERT_INTERNAL_DIE_IF_NULL(
+            runtime_c_api == nullptr ? GetLiteRtRuntimeBuiltin()
+                                     : runtime_c_api)),
+        abi_version_(DefaultRuntimeAbiVersion(runtime_c_api)),
+        abi_version_resolved_(runtime_c_api == nullptr) {}
 
   /// @brief Creates a runtime proxy with the externally provided system runtime
   /// handle and an explicit ABI version.
@@ -169,7 +187,8 @@ class RuntimeProxy {
       : runtime_c_api_(LITERT_INTERNAL_DIE_IF_NULL(
             runtime_c_api == nullptr ? GetLiteRtRuntimeBuiltin()
                                      : runtime_c_api)),
-        abi_version_(abi_version) {}
+        abi_version_(abi_version),
+        abi_version_resolved_(true) {}
 
   ~RuntimeProxy() = default;
 
@@ -1412,6 +1431,15 @@ class RuntimeProxy {
                                signature_name, tensor_name, data, size_bytes);
   }
 
+  LiteRtStatus SetOpResolverOption(LiteRtOptions options,
+                                   LiteRtFindBuiltinOpFunc find_builtin_op,
+                                   LiteRtFindCustomOpFunc find_custom_op,
+                                   void* user_data) {
+    LITERT_PROXY_METHOD_STATUS_MIN_VERSION(
+        1, 7, 0, litert_set_op_resolver_option, options, find_builtin_op,
+        find_custom_op, user_data);
+  }
+
   LiteRtStatus EnvironmentSupportsFP16(LiteRtEnvironment environment,
                                        bool* is_supported) {
     LITERT_PROXY_METHOD_STATUS(litert_environment_supports_fp16, environment,
@@ -1447,22 +1475,62 @@ class RuntimeProxy {
   }
 
  protected:
-  static RuntimeAbiVersion ResolveRuntimeAbiVersion(
+  static constexpr RuntimeAbiVersion DefaultRuntimeAbiVersion(
       const LiteRtRuntimeCApiStruct* runtime_c_api) {
-    if (runtime_c_api == nullptr) {
-      // When no external system runtime handle is provided, RuntimeProxy uses
-      // the builtin runtime (GetLiteRtRuntimeBuiltin()), whose ABI version
-      // matches the SDK's kBuiltinRuntimeAbiVersion.
-      return kBuiltinRuntimeAbiVersion;
-    }
-    // TODO(b/574171444): Query `litert_get_runtime_abi_version` from
-    // `runtime_c_api` once the next LiteRT in Google Play services rollout
-    // reaches 100%.
-    return RuntimeAbiVersion(1, 0, 0);
+    // External system runtimes may predate post-1.0.0 LiteRtRuntimeCApiStruct
+    // fields, so start at 1.0.0 until ResolveAbiVersionFromEnvironment()
+    // inspects the created environment's 1.0.0 options API.
+    return runtime_c_api == nullptr ? kBuiltinRuntimeAbiVersion
+                                    : RuntimeAbiVersion(1, 0, 0);
   }
 
+  void ResolveAbiVersionFromEnvironment(LiteRtEnvironment environment) {
+    if (abi_version_resolved_ || environment == nullptr) {
+      return;
+    }
+    abi_version_resolved_ = true;
+    LiteRtEnvironmentOptions options = nullptr;
+    if (GetEnvironmentOptions(environment, &options) != kLiteRtStatusOk ||
+        options == nullptr) {
+      return;
+    }
+    LiteRtAny value{};
+    if (GetEnvironmentOptionsValue(
+            options, kLiteRtEnvOptionTagRuntimeAbiVersion, &value) !=
+        kLiteRtStatusOk) {
+      return;
+    }
+    if (value.type != kLiteRtAnyTypeString || value.str_value == nullptr) {
+      abi_version_ = RuntimeAbiVersion(1, 0, 0);
+      return;
+    }
+    std::optional<RuntimeAbiVersion> parsed =
+        RuntimeAbiVersion::Parse(StringView(value.str_value));
+    abi_version_ = (parsed.has_value() && parsed->IsCompatibleWithClient())
+                       ? *parsed
+                       : RuntimeAbiVersion(1, 0, 0);
+  }
+
+ private:
+  // Returns true if the runtime is the in-process builtin runtime.
+  // It is a class invariant that `runtime_c_api_` is non-null.
+  bool IsBuiltinRuntime() const noexcept {
+    return runtime_c_api_ == GetLiteRtRuntimeBuiltin();
+  }
+
+ protected:
+  // Non-null pointer to the underlying runtime C API vtable (defaults to
+  // GetLiteRtRuntimeBuiltin() when no external system runtime is provided).
   const LiteRtRuntimeCApiStruct* runtime_c_api_;
+  // Resolved ABI version of `runtime_c_api_`. Starts at
+  // `kBuiltinRuntimeAbiVersion` for the builtin runtime, or `1.0.0` for an
+  // external runtime until ResolveAbiVersionFromEnvironment() inspects the
+  // created environment's options.
   RuntimeAbiVersion abi_version_;
+  // Whether `abi_version_` has been finalized (already `true` for the builtin
+  // runtime or when an explicit RuntimeAbiVersion is passed to the
+  // constructor; set to `true` once ResolveAbiVersionFromEnvironment() runs).
+  bool abi_version_resolved_ = false;
 };
 
 #undef LITERT_PROXY_METHOD_STATUS

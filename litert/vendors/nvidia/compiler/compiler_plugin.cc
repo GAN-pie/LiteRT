@@ -85,11 +85,12 @@ using litert::Expected;
 
 constexpr char kPluginManufacturer[] = "NVIDIA";
 constexpr char kPluginSocModel[] = "tensorrt-rtx";
-constexpr uint32_t kNvidiaCompilerCacheSchemaVersion = 15;
+constexpr uint32_t kNvidiaCompilerCacheSchemaVersion = 26;
 
 enum class PartitionPolicy {
   kSafe,
   kGemma4,
+  kQwen35,
   kCompute,
   kAll,
 };
@@ -188,6 +189,8 @@ struct PendingBundleEntry {
       feed.multiplier = step_feed->multiplier;
       feed.row_scales = step_feed->row_scales.data();
       feed.row_scales_size = step_feed->row_scales.size();
+      feed.table_bits = step_feed->table_bits;
+      feed.table_zero_point = step_feed->table_zero_point;
       feed_ptr = &feed;
     }
     if (trtllm_head.has_value()) {
@@ -276,6 +279,9 @@ PartitionPolicy GetPartitionPolicy() {
   if (policy == "gemma4") {
     return PartitionPolicy::kGemma4;
   }
+  if (policy == "qwen3_5") {
+    return PartitionPolicy::kQwen35;
+  }
   if (policy == "compute") {
     return PartitionPolicy::kCompute;
   }
@@ -290,6 +296,8 @@ const char* PartitionPolicyName(PartitionPolicy policy) {
       return "compute";
     case PartitionPolicy::kGemma4:
       return "gemma4";
+    case PartitionPolicy::kQwen35:
+      return "qwen3_5";
     case PartitionPolicy::kSafe:
       return "safe";
   }
@@ -352,11 +360,16 @@ bool IsValidatedGemma4TensorRtOp(const litert::compiler::Op& op) {
     case kLiteRtOpCodeTflGreaterEqual:
     case kLiteRtOpCodeTflLess:
     case kLiteRtOpCodeTflLogicalAnd:
+    // The SiLU between the stages of a factorized MLP (LOGISTIC, MUL).
+    case kLiteRtOpCodeTflLogistic:
     case kLiteRtOpCodeTflMaximum:
     case kLiteRtOpCodeTflMean:
     case kLiteRtOpCodeTflMinimum:
     case kLiteRtOpCodeTflMul:
     case kLiteRtOpCodeTflNotEqual:
+    // Only as the selector of a table lookup (the Gemma 4 vision export's
+    // position embeddings); other one-hots are not supported.
+    case kLiteRtOpCodeTflOneHot:
     case kLiteRtOpCodeTflPack:
     case kLiteRtOpCodeTflQuantize:
     case kLiteRtOpCodeTflReduceMax:
@@ -376,6 +389,22 @@ bool IsValidatedGemma4TensorRtOp(const litert::compiler::Op& op) {
       return true;
     default:
       return false;
+  }
+}
+
+// Qwen 3.5's hybrid stack in whole-signature islands, as for Gemma 4: its
+// attention layers use the same composites, and its Gated DeltaNet layers
+// add the gated_delta_update custom op, the short convolution composite and
+// the elementwise ops of their gates and decays.
+bool IsValidatedQwen35TensorRtOp(const litert::compiler::Op& op) {
+  switch (op.Code()) {
+    case kLiteRtOpCodeTflExp:
+    case kLiteRtOpCodeTflGreater:
+    case kLiteRtOpCodeTflLog:
+    case kLiteRtOpCodeTflLogistic:
+      return true;
+    default:
+      return IsValidatedGemma4TensorRtOp(op);
   }
 }
 
@@ -450,6 +479,8 @@ bool IsPolicyAllowedOp(const litert::compiler::Op& op, PartitionPolicy policy) {
       return IsComputeHeavyOp(op);
     case PartitionPolicy::kGemma4:
       return IsValidatedGemma4TensorRtOp(op);
+    case PartitionPolicy::kQwen35:
+      return IsValidatedQwen35TensorRtOp(op);
     case PartitionPolicy::kSafe:
       return IsSafeGemma4Op(op);
   }
@@ -530,7 +561,11 @@ std::string BuildCompilerSdkVersion() {
       "LITERT_NVIDIA_TENSORRT_FUSE_GEMV_GROUPS",
       "LITERT_NVIDIA_TENSORRT_FUSE_MOE_ROUTER",
       "LITERT_NVIDIA_TENSORRT_FUSE_MOE_BLOCK",
+      "LITERT_NVIDIA_TENSORRT_FUSE_GATED_DELTA_NET",
       "LITERT_NVIDIA_TENSORRT_FUSE_NORM_GEMV",
+      "LITERT_NVIDIA_TENSORRT_FUSE_SWIGLU",
+      "LITERT_NVIDIA_TENSORRT_GLOBAL_ATTENTION_PLUGIN",
+      "LITERT_NVIDIA_TENSORRT_INT8_BLOCKWISE_GEMM",
       "LITERT_NVIDIA_TENSORRT_JIT_HANDLE",
       "LITERT_NVIDIA_TENSORRT_MAX_FC_WEIGHT_BYTES",
       "LITERT_NVIDIA_TENSORRT_MAX_FILL_BYTES",
@@ -1379,8 +1414,9 @@ bool ContainsReductionOp(const LiteRtCompilerContext* ctx,
   return false;
 }
 
-// Whether the island writes a KV cache: an odml.cache_update composite or a
-// dynamic update slice. Such an island is kept however small: on the CPU it
+// Whether the island writes a KV cache: an odml.cache_update or
+// odml.fused_sdpa_cache_update composite or a dynamic update slice. Such an
+// island is kept however small: on the CPU it
 // would rewrite a whole cache that the engines keep on the device (Gemma 4
 // 26B's prefill ends with the last layer's cache update, which the unlowered
 // rope composite before it cuts off from the rest of the graph).
@@ -1394,7 +1430,9 @@ bool ContainsCacheUpdate(const LiteRtCompilerContext* ctx,
     const char* name = nullptr;
     if (op.Code() == kLiteRtOpCodeShloComposite &&
         LiteRtGetSHLOCompositeOpName(raw_op, &name) == kLiteRtStatusOk &&
-        name != nullptr && std::strcmp(name, "odml.cache_update") == 0) {
+        name != nullptr &&
+        (std::strcmp(name, "odml.cache_update") == 0 ||
+         std::strcmp(name, "odml.fused_sdpa_cache_update") == 0)) {
       return true;
     }
   }
@@ -1966,7 +2004,11 @@ LiteRtStatus LiteRtCompilerPluginCompile(
               cached_manifest->call_infos[i] == PartitionName(i);
         }
         if (call_layout_matches) {
+          // LiteRT gets the locators padded (bytecode.h).
           result->bytecodes = std::move(cached_manifest->locators);
+          for (auto& locator : result->bytecodes) {
+            litert::nvidia::PadTensorRtAotLocator(locator);
+          }
           result->call_infos = std::move(cached_manifest->call_infos);
           result->bytecode_indices.reserve(
               cached_manifest->bytecode_indices.size());
@@ -2284,6 +2326,13 @@ LiteRtStatus LiteRtCompilerPluginCompile(
     memory_profiler.Log("jit_handles_ready", soc_model);
   }
 
+  if (!aot_cache_dir.empty()) {
+    // The modules are locators: LiteRT gets them padded, as from the index,
+    // which has them as they were packed.
+    for (auto& locator : result->bytecodes) {
+      litert::nvidia::PadTensorRtAotLocator(locator);
+    }
+  }
   memory_profiler.Log("compile_end", soc_model);
   *compiled_result = result.release();
   return kLiteRtStatusOk;

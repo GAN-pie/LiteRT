@@ -15,9 +15,9 @@
 #include "ml_drift_delegate/delegate/buffer_handler_utils.h"
 
 #include <cstdint>
+#include <limits>
 
 #include "absl/status/status.h"  // from @com_google_absl
-#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "ml_drift/common/data_type.h"  // from @ml_drift
@@ -28,37 +28,6 @@
 #include "litert/c/litert_tensor_buffer_types.h"
 
 namespace litert::ml_drift {
-
-absl::StatusOr<::ml_drift::DataType> ToMlDriftDataType(
-    LiteRtElementType element_type) {
-  switch (element_type) {
-    case kLiteRtElementTypeFloat32:
-      return ::ml_drift::DataType::kFloat32;
-    case kLiteRtElementTypeFloat16:
-      return ::ml_drift::DataType::kFloat16;
-    case kLiteRtElementTypeInt32:
-      return ::ml_drift::DataType::kInt32;
-    case kLiteRtElementTypeInt64:
-      return ::ml_drift::DataType::kInt64;
-    case kLiteRtElementTypeUInt32:
-      return ::ml_drift::DataType::kUint32;
-    case kLiteRtElementTypeUInt64:
-      return ::ml_drift::DataType::kUint64;
-    case kLiteRtElementTypeInt16:
-      return ::ml_drift::DataType::kInt16;
-    case kLiteRtElementTypeUInt16:
-      return ::ml_drift::DataType::kUint16;
-    case kLiteRtElementTypeInt8:
-      return ::ml_drift::DataType::kInt8;
-    case kLiteRtElementTypeUInt8:
-      return ::ml_drift::DataType::kUint8;
-    case kLiteRtElementTypeBool:
-      return ::ml_drift::DataType::kBool;
-    default:
-      return absl::InvalidArgumentError(
-          absl::StrCat("Unsupported element type: ", element_type));
-  }
-}
 
 absl::StatusOr<::ml_drift::TensorDescriptor> CreateTensorDescriptor(
     const LiteRtRankedTensorType& tensor_type,
@@ -95,11 +64,83 @@ absl::StatusOr<::ml_drift::TensorDescriptor> CreateTensorDescriptor(
           "Rank ", tensor_type.layout.rank, " tensor is not supported."));
   }
 
-  ABSL_ASSIGN_OR_RETURN(auto data_type,
-                        ToMlDriftDataType(tensor_type.element_type));
-  if (data_type == ::ml_drift::DataType::kFloat32 &&
-      IsGpuFloat16Memory(buffer_type)) {
-    data_type = ::ml_drift::DataType::kFloat16;
+  ::ml_drift::DataType data_type;
+  switch (tensor_type.element_type) {
+    case kLiteRtElementTypeFloat32:
+      data_type = IsGpuFloat16Memory(buffer_type)
+                      ? ::ml_drift::DataType::kFloat16
+                      : ::ml_drift::DataType::kFloat32;
+      break;
+    case kLiteRtElementTypeBool:
+      data_type = ::ml_drift::DataType::kBool;
+      break;
+    case kLiteRtElementTypeInt32:
+      data_type = ::ml_drift::DataType::kInt32;
+      break;
+    case kLiteRtElementTypeFloat16:
+      data_type = ::ml_drift::DataType::kFloat16;
+      break;
+    case kLiteRtElementTypeInt8:
+      data_type = ::ml_drift::DataType::kInt8;
+      break;
+    case kLiteRtElementTypeUInt8:
+      data_type = ::ml_drift::DataType::kUint8;
+      break;
+    case kLiteRtElementTypeUInt32:
+      data_type = ::ml_drift::DataType::kUint32;
+      break;
+    case kLiteRtElementTypeInt64:
+      data_type = ::ml_drift::DataType::kInt64;
+      break;
+    case kLiteRtElementTypeUInt64:
+      data_type = ::ml_drift::DataType::kUint64;
+      break;
+    case kLiteRtElementTypeInt16:
+      data_type = ::ml_drift::DataType::kInt16;
+      break;
+    case kLiteRtElementTypeUInt16:
+      data_type = ::ml_drift::DataType::kUint16;
+      break;
+    case kLiteRtElementTypeInt4:
+    case kLiteRtElementTypeUInt4: {
+      if (!IsGpuBuffer(buffer_type)) {
+        return absl::InvalidArgumentError(
+            "4-bit tensors only support GPU buffer storage.");
+      }
+      if (shape.b < 0 || shape.h < 0 || shape.w < 0 || shape.c < 0) {
+        return absl::InvalidArgumentError(
+            "4-bit tensors require non-negative static dimensions.");
+      }
+      constexpr uint64_t kMaxPackedBytes =
+          static_cast<uint64_t>(std::numeric_limits<int>::max() - 3);
+      constexpr uint64_t kMaxElements = kMaxPackedBytes * 2;
+      uint64_t num_elements = 0;
+      if (shape.b != 0 && shape.h != 0 && shape.w != 0 && shape.c != 0) {
+        num_elements = 1;
+        const int dims[] = {shape.b, shape.h, shape.w, shape.c};
+        for (const int dim : dims) {
+          const uint64_t dim_u64 = static_cast<uint64_t>(dim);
+          if (dim_u64 > kMaxElements / num_elements) {
+            return absl::InvalidArgumentError(
+                "4-bit tensor exceeds maximum size.");
+          }
+          num_elements *= dim_u64;
+        }
+      }
+      // ML Drift's SizeOf(DataType::kInt4/kUint4) is 1 byte/element and
+      // TensorDescriptor lacks sub-byte UploadData/DownloadData paths; linear
+      // 4-bit buffers are represented as packed kUint8 bytes (as in
+      // weights_conversion.cc). Flattening to HWC(1, 1, packed_bytes) handles
+      // arbitrary 1D-4D shapes (including odd channel sizes) without per-row
+      // 4-byte BHWC channel padding.
+      const uint64_t packed_bytes = (num_elements + 1) / 2;
+      return ::ml_drift::CreateHwcTensorDescriptor(
+          ::ml_drift::DataType::kUint8, ::ml_drift::TensorStorageType::kBuffer,
+          ::ml_drift::HWC(1, 1, static_cast<int>(packed_bytes)));
+    }
+    default:
+      return absl::InvalidArgumentError(
+          absl::StrCat("Unsupported element type: ", tensor_type.element_type));
   }
 
   ::ml_drift::TensorStorageType storage_type;
@@ -133,7 +174,9 @@ void ConvertDataToDescriptor(void* host_memory,
     desc.UploadData(reinterpret_cast<::ml_drift::half*>(host_memory));
   } else if (src_type == kLiteRtElementTypeInt8) {
     desc.UploadData(reinterpret_cast<int8_t*>(host_memory));
-  } else if (src_type == kLiteRtElementTypeUInt8) {
+  } else if (src_type == kLiteRtElementTypeUInt8 ||
+             src_type == kLiteRtElementTypeInt4 ||
+             src_type == kLiteRtElementTypeUInt4) {
     desc.UploadData(reinterpret_cast<uint8_t*>(host_memory));
   } else if (src_type == kLiteRtElementTypeUInt32) {
     desc.UploadData(reinterpret_cast<uint32_t*>(host_memory));
@@ -160,7 +203,9 @@ void ConvertDataFromDescriptor(const ::ml_drift::TensorDescriptor& desc,
     desc.DownloadData(reinterpret_cast<::ml_drift::half*>(host_memory));
   } else if (dst_type == kLiteRtElementTypeInt8) {
     desc.DownloadData(reinterpret_cast<int8_t*>(host_memory));
-  } else if (dst_type == kLiteRtElementTypeUInt8) {
+  } else if (dst_type == kLiteRtElementTypeUInt8 ||
+             dst_type == kLiteRtElementTypeInt4 ||
+             dst_type == kLiteRtElementTypeUInt4) {
     desc.DownloadData(reinterpret_cast<uint8_t*>(host_memory));
   } else if (dst_type == kLiteRtElementTypeUInt32) {
     desc.DownloadData(reinterpret_cast<uint32_t*>(host_memory));

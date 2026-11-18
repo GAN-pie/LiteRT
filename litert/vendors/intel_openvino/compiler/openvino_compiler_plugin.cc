@@ -562,6 +562,12 @@ LiteRtStatus LiteRtCompilerPluginCompile(
     // the SAME ascending-id order Serialize() lays out, so a Constant's WLCA
     // bin_offset equals its position in the temp file staged at dispatch.
     std::map<int32_t, size_t> pool_offset_of;
+    // Content-derived NPUW weights-bank name for the NPU shared path (stays
+    // empty for the GPU path / non-shared compiles).
+    // ConfigureForNpuWeightSharing bakes this into the blob; it MUST be unique
+    // per distinct weight pool or NPUW's global, name-keyed BankManager
+    // collides across models at import.
+    std::string npu_weights_bank_name;
 
     // Phase 1: build the shared pool. On the NPU path every partition is also
     // converted and optimized once to learn which constants survive
@@ -616,6 +622,7 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         global_graph.buffers.push_back({static_cast<uint32_t>(entry.buffer_id),
                                         entry.pool_offset, entry.bytes});
       }
+      npu_weights_bank_name = layout.WeightsBankName();
     }
 
     // Phase 2: rebuild each partition, alias its weights against the now-final
@@ -651,20 +658,22 @@ LiteRtStatus LiteRtCompilerPluginCompile(
 
         // Run NPU-specific optimization passes.
         const auto optimize_result = context.OptimizeModel(ov_model);
-        if (share_npu) {
-          // Must run after OptimizeModel: it configures NPUW from what the
-          // passes classified, which is knowable only once they have run.
-          context.ConfigureForNpuWeightSharing(
-              optimize_result.moe_is_multi_token_chunk);
-        }
 
-        ov::AnyMap configs = context.ConfigsMap();
         std::map<std::string, uint32_t> const_map;
+        bool npuw_configured = false;
         if (share_weights) {
           if (share_npu) {
-            // NPU: alias+tag weights (see AliasAndTagSharedConstants).
-            litert::openvino::AliasAndTagSharedConstants(
+            // NPU: alias+tag weights first, and enable NPUW weightless sharing
+            // only when this partition actually references shared pool weights.
+            const size_t aliased = litert::openvino::AliasAndTagSharedConstants(
                 ov_model, weight_bank, pool_offset_of, partition_idx);
+            if (aliased > 0) {
+              // Must run after OptimizeModel: it configures NPUW from what the
+              // passes classified, which is knowable only once they have run.
+              LITERT_RETURN_IF_ERROR(context.ConfigureForNpuWeightSharing(
+                  npu_weights_bank_name, optimize_result));
+              npuw_configured = true;
+            }
           } else {
             // GPU: convert weights to Parameters bound to the shared bank at
             // dispatch; const_map records friendly_name -> BufferId.
@@ -677,6 +686,16 @@ LiteRtStatus LiteRtCompilerPluginCompile(
                        converted, partition_idx);
           }
         }
+        if (!npuw_configured &&
+            optimize_result.num_sdpa_decomposed_for_hfa > 0) {
+          LITERT_LOG(LITERT_WARNING,
+                     "enable_hfa: NPUW_ATTN=HFA is set only on NPU partitions "
+                     "that share pool weights; partition %d gets its attention "
+                     "decomposed but no HFA unless NPUW_ATTN=HFA is passed "
+                     "explicitly",
+                     partition_idx);
+        }
+        ov::AnyMap configs = context.ConfigsMap();
 
         // KV tier: the largest static extent over this partition's
         // "kv_cache" inputs, i.e. the context length it was compiled for.
@@ -702,8 +721,8 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         }
 
         // Compile using the per-partition device and properties.
-        litert::openvino::LogOpenVINOVersionInfoOnce("OpenVINO Compiler",
-                                                     context.Device().c_str());
+        litert::openvino::LogOpenVINOVersionInfoOnce(
+            "OpenVINO Compiler", context.Device().c_str(), configs);
         LITERT_LOG(LITERT_INFO, "Compiling partition %d for device %s",
                    partition_idx, context.Device().c_str());
         auto compiled_model =

@@ -83,7 +83,9 @@ template <typename TensorType>
   if (weights_tensor.quantization.type == kTfLiteBlockwiseQuantization) {
     const auto* qparams = reinterpret_cast<const TfLiteBlockwiseQuantization*>(
         weights_tensor.quantization.params);
-    scale_shape.i = weights_shape.i / qparams->blocksize;
+    if (qparams != nullptr && qparams->blocksize > 0) {
+      scale_shape.i = weights_shape.i / qparams->blocksize;
+    }
   }
   return scale_shape;
 }
@@ -242,6 +244,13 @@ bool ConfigSharedQuantizedFullyConnected(
                             ? reinterpret_cast<const TfLiteAffineQuantization*>(
                                   weights_tensor.quantization.params)
                             : nullptr;
+  bool has_zero_point = true;
+  if (weights_tensor.quantization.type == kTfLiteBlockwiseQuantization) {
+    const auto* block_qparams =
+        reinterpret_cast<const TfLiteBlockwiseQuantization*>(
+            weights_tensor.quantization.params);
+    has_zero_point = block_qparams != nullptr && block_qparams->zero_point >= 0;
+  }
 
   auto populate_quant_attrs = [&](auto& attr) {
     attr.scale.shape = scale_shape;
@@ -254,16 +263,18 @@ bool ConfigSharedQuantizedFullyConnected(
         attr.scale.data.resize(num_scales, attr.scale.data[0]);
       }
     }
-    attr.zero_point.shape = scale_shape;
-    if (qparams && qparams->zero_point && qparams->zero_point->size > 0) {
-      attr.zero_point.data = std::vector<int32_t>(
-          qparams->zero_point->data,
-          qparams->zero_point->data + qparams->zero_point->size);
-      if (attr.zero_point.data.size() == 1 && num_scales > 1) {
-        attr.zero_point.data.resize(num_scales, attr.zero_point.data[0]);
+    if (has_zero_point) {
+      attr.zero_point.shape = scale_shape;
+      if (qparams && qparams->zero_point && qparams->zero_point->size > 0) {
+        attr.zero_point.data = std::vector<int32_t>(
+            qparams->zero_point->data,
+            qparams->zero_point->data + qparams->zero_point->size);
+        if (attr.zero_point.data.size() == 1 && num_scales > 1) {
+          attr.zero_point.data.resize(num_scales, attr.zero_point.data[0]);
+        }
+      } else if (has_quant) {
+        attr.zero_point.data.resize(num_scales, 0);
       }
-    } else {
-      attr.zero_point.data.resize(num_scales, 0);
     }
   };
 
@@ -451,6 +462,28 @@ void PopulateBlockwiseQuantizedFullyConnected(
   ir_model.SetProducer(tensor->id, node->id);
   node->attr = std::move(attr);
   return tensor;
+}
+
+void AddNodeInputs(
+    const TfLiteContext& context, const TfLiteNode& node,
+    absl::flat_hash_map<int, ::ml_drift::ir::IrTensorId>& tensor_map,
+    const SizedLayout& layout, ::ml_drift::ir::IrModel& ir_model,
+    ::ml_drift::ir::IrOp* op) {
+  for (int i = 0; i < node.inputs->size; ++i) {
+    const int input_id = node.inputs->data[i];
+    if (input_id == kTfLiteOptionalTensor) {
+      continue;
+    }
+    const auto ir_tensor_id = tensor_map[input_id];
+    if (tflite::IsConstantTensor(context.tensors + input_id) &&
+        !ir_model.tensor(ir_tensor_id)->buffer_source.is_shared) {
+      ::ml_drift::ir::IrTensor* const_tensor =
+          AddConstInput(context, input_id, ir_model, layout);
+      ir_model.AddConsumer(const_tensor->id, op->id);
+    } else {
+      ir_model.AddConsumer(ir_tensor_id, op->id);
+    }
+  }
 }
 
 ::ml_drift::Axis ExtractAxisFromIndex(const TfLiteTensor& tflite_tensor,

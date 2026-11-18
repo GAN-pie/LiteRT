@@ -35,9 +35,14 @@
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"  // from @com_google_absl
 #include "absl/cleanup/cleanup.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/container/flat_hash_set.h"  // from @com_google_absl
+#if !defined(LITERT_DISABLE_CPU)
+#include "absl/base/thread_annotations.h"  // from @com_google_absl
+#include "absl/synchronization/mutex.h"  // from @com_google_absl
+#endif  // !defined(LITERT_DISABLE_CPU)
 #include "litert/c/options/litert_cpu_options.h"
 #include "tflite/c/c_api.h"
 #include "tflite/mutable_op_resolver.h"
@@ -83,7 +88,9 @@
 #include "litert/cc/litert_opaque_options.h"
 #include "litert/core/buffer_error_reporter.h"
 #include "litert/core/build_stamp.h"
+#include "litert/core/dispatch_op_schema.h"
 #include "litert/core/error_reporter.h"
+#include "litert/core/model/buffer_manager.h"
 #include "litert/core/model/model.h"
 #include "litert/core/util/perfetto_profiling.h"
 #include "tflite/model_builder.h"
@@ -107,6 +114,7 @@
 #include "litert/runtime/magic_number_utils.h"
 #endif  // !defined(LITERT_NO_BUILTIN_OPS)
 #include "litert/runtime/metrics.h"
+#include "litert/runtime/model_buffer_writes.h"
 #include "litert/runtime/tensor_buffer.h"
 #include "litert/runtime/tensor_buffer_requirements.h"
 #include "litert/runtime/tensor_identifier.h"
@@ -116,6 +124,7 @@
 #endif  // !defined(LITERT_DISABLE_EXTERNAL_WEIGHTS)
 #include "tflite/converter/allocation.h"
 #include "tflite/builtin_ops.h"
+#include "tflite/core/api/op_resolver.h"
 #include "tflite/core/api/profiler.h"
 #include "tflite/core/interpreter_builder.h"
 #include "tflite/interpreter.h"
@@ -124,6 +133,7 @@
 #include "tflite/kernels/register.h"
 #include "tflite/kernels/register_ref.h"
 #endif  // LITERT_NO_BUILTIN_OPS
+#include "tflite/schema/schema_generated.h"
 
 #if defined(LITERT_NO_BUILTIN_OPS)
 #include "litert/runtime/stub_op_resolver.h"
@@ -159,6 +169,40 @@ std::optional<std::string> ExtractDirectory(absl::string_view path) {
   return std::string(path.substr(0, last_sep));
 }
 
+// Returns the function names of the dispatch ops in the active subgraphs.
+// Note: `active_subgraph_indices` currently only includes the root subgraphs
+// for the selected signatures (see `InitializeActiveSubgraphs`). Until
+// transitive callee discovery is implemented, any `DISPATCH_OP` inside a
+// child subgraph invoked via control flow ops (e.g., `IF`/`WHILE`/`CALL_ONCE`)
+// will not be collected here and will rely on the vendor dispatch fallback
+// for unreported functions.
+std::vector<std::string> GetExpectedDispatchFunctionNames(
+    const tflite::Interpreter& interp,
+    absl::Span<const int> active_subgraph_indices) {
+  std::vector<std::string> names;
+  for (int subgraph_no : active_subgraph_indices) {
+    const auto* const subgraph = interp.subgraph(subgraph_no);
+    const auto& nodes_and_registration = subgraph->nodes_and_registration();
+    for (int node_index : subgraph->execution_plan()) {
+      const auto& [node, reg] = nodes_and_registration[node_index];
+      if (reg.builtin_code != kTfLiteBuiltinCustom || !reg.custom_name ||
+          !absl::StrContains(reg.custom_name,
+                             litert::internal::kLiteRtDispatchOpCustomName) ||
+          !node.custom_initial_data || node.custom_initial_data_size <= 0) {
+        continue;
+      }
+      auto dispatch_opts =
+          litert::internal::GetDispatchOpOptions(litert::BufferRef<uint8_t>(
+              node.custom_initial_data, node.custom_initial_data_size));
+      if (!dispatch_opts.name.empty() &&
+          !absl::c_linear_search(names, dispatch_opts.name)) {
+        names.push_back(std::move(dispatch_opts.name));
+      }
+    }
+  }
+  return names;
+}
+
 void* StubOpInit([[maybe_unused]] TfLiteContext* context,
                  [[maybe_unused]] const char* buffer,
                  [[maybe_unused]] size_t length) {
@@ -187,6 +231,121 @@ TfLiteRegistration sStubRegistration = {
     .prepare = StubOpPrepare,
     .invoke = StubOpEval,
 };
+
+#if !defined(LITERT_DISABLE_CPU)
+class CApiForwardingOpResolver : public tflite::OpResolver {
+ public:
+  CApiForwardingOpResolver(
+      const LiteRtOptionsT::OpResolverCallbacks& callbacks,
+      std::vector<std::unique_ptr<TfLiteRegistration>>& owned_registrations)
+      : callbacks_(callbacks), owned_registrations_(owned_registrations) {}
+
+  const TfLiteRegistration* FindOp(tflite::BuiltinOperator op,
+                                   int version) const override {
+    if (callbacks_.find_builtin_op == nullptr) {
+      return nullptr;
+    }
+    const auto key = std::make_pair(static_cast<int>(op), version);
+    {
+      absl::MutexLock lock(mutex_);
+      if (auto it = builtin_cache_.find(key); it != builtin_cache_.end()) {
+        return it->second;
+      }
+    }
+    const TfLiteOperator* op_ext = callbacks_.find_builtin_op(
+        callbacks_.user_data, static_cast<int>(op), version);
+    if (op_ext == nullptr) {
+      return nullptr;
+    }
+    absl::MutexLock lock(mutex_);
+    auto [it, inserted] = builtin_cache_.try_emplace(key, nullptr);
+    if (!inserted) {
+      return it->second;
+    }
+    auto new_reg = std::make_unique<TfLiteRegistration>();
+    new_reg->builtin_code = static_cast<int32_t>(op);
+    new_reg->custom_name = nullptr;
+    new_reg->version = version;
+    new_reg->registration_external = const_cast<TfLiteOperator*>(op_ext);
+    it->second = new_reg.get();
+    owned_registrations_.push_back(std::move(new_reg));
+    return it->second;
+  }
+
+  const TfLiteRegistration* FindOp(const char* op, int version) const override {
+    if (op == nullptr || callbacks_.find_custom_op == nullptr) {
+      return nullptr;
+    }
+    const auto key = std::make_pair(std::string(op), version);
+    {
+      absl::MutexLock lock(mutex_);
+      if (auto it = custom_cache_.find(key); it != custom_cache_.end()) {
+        return it->second;
+      }
+    }
+    const TfLiteOperator* op_ext =
+        callbacks_.find_custom_op(callbacks_.user_data, op, version);
+    if (op_ext == nullptr) {
+      return nullptr;
+    }
+    absl::MutexLock lock(mutex_);
+    auto [it, inserted] = custom_cache_.try_emplace(key, nullptr);
+    if (!inserted) {
+      return it->second;
+    }
+    auto new_reg = std::make_unique<TfLiteRegistration>();
+    new_reg->builtin_code = tflite::BuiltinOperator_CUSTOM;
+    new_reg->custom_name = TfLiteOperatorGetCustomName(op_ext);
+    new_reg->version = version;
+    new_reg->registration_external = const_cast<TfLiteOperator*>(op_ext);
+    it->second = new_reg.get();
+    owned_registrations_.push_back(std::move(new_reg));
+    return it->second;
+  }
+
+ private:
+  LiteRtOptionsT::OpResolverCallbacks callbacks_;
+  mutable absl::Mutex mutex_;
+  std::vector<std::unique_ptr<TfLiteRegistration>>& owned_registrations_
+      ABSL_GUARDED_BY(mutex_);
+  mutable absl::flat_hash_map<std::pair<int, int>, const TfLiteRegistration*>
+      builtin_cache_ ABSL_GUARDED_BY(mutex_);
+  mutable absl::flat_hash_map<std::pair<std::string, int>,
+                              const TfLiteRegistration*>
+      custom_cache_ ABSL_GUARDED_BY(mutex_);
+};
+
+class CApiOpResolver : public tflite::MutableOpResolver {
+ public:
+  CApiOpResolver(
+      const LiteRtOptionsT::OpResolverCallbacks& callbacks,
+      std::vector<std::unique_ptr<TfLiteRegistration>>& owned_registrations)
+      : c_api_forwarder_(callbacks, owned_registrations) {
+    ChainOpResolver(&c_api_forwarder_);
+    may_directly_contain_user_defined_ops_ = true;
+  }
+
+ private:
+  CApiForwardingOpResolver c_api_forwarder_;
+};
+#endif  // !defined(LITERT_DISABLE_CPU)
+
+// Creates an op resolver forwarding lookups to C API callbacks. Omitted in
+// minimal CPU builds (`LITERT_DISABLE_CPU`), which are always statically linked
+// and pass an in-process `tflite::MutableOpResolver` directly.
+Expected<std::unique_ptr<tflite::MutableOpResolver>> CreateCApiOpResolver(
+    [[maybe_unused]] const LiteRtOptionsT::OpResolverCallbacks& callbacks,
+    [[maybe_unused]] std::vector<std::unique_ptr<TfLiteRegistration>>&
+        owned_registrations) {
+#if !defined(LITERT_DISABLE_CPU)
+  return std::unique_ptr<tflite::MutableOpResolver>(
+      std::make_unique<CApiOpResolver>(callbacks, owned_registrations));
+#else
+  return Unexpected(
+      kLiteRtStatusErrorUnsupported,
+      "Op resolver callbacks are not supported in minimal CPU builds.");
+#endif  // !defined(LITERT_DISABLE_CPU)
+}
 
 #if !defined(LITERT_DISABLE_NPU)
 LiteRtLogSeverity GetLogSeverityForJitCompilationFailure(
@@ -339,7 +498,8 @@ Expected<void> LiteRtCompiledModelT::InitializeRuntime(
 
   const bool has_user_op_resolver =
       jit_compilation_options &&
-      jit_compilation_options->op_resolver != nullptr;
+      (jit_compilation_options->op_resolver != nullptr ||
+       jit_compilation_options->op_resolver_callbacks.has_value());
   std::unique_ptr<tflite::MutableOpResolver> resolver_storage;
   tflite::MutableOpResolver* resolver = nullptr;
   if (has_user_op_resolver) {
@@ -351,8 +511,15 @@ Expected<void> LiteRtCompiledModelT::InitializeRuntime(
                         "kernels.");
     }
 #endif  // LITERT_NO_BUILTIN_OPS
-    resolver_storage = std::make_unique<tflite::MutableOpResolver>(
-        *jit_compilation_options->op_resolver);
+    if (jit_compilation_options->op_resolver_callbacks.has_value()) {
+      LITERT_ASSIGN_OR_RETURN(
+          resolver_storage,
+          CreateCApiOpResolver(*jit_compilation_options->op_resolver_callbacks,
+                               owned_tflite_registrations_));
+    } else {
+      resolver_storage = std::make_unique<tflite::MutableOpResolver>(
+          *jit_compilation_options->op_resolver);
+    }
     resolver = resolver_storage.get();
   } else {
 #ifdef LITERT_NO_BUILTIN_OPS
@@ -579,7 +746,9 @@ Expected<void> LiteRtCompiledModelT::InitializeRuntime(
         LrtGetRuntimeContext(), fb_model_->GetModel(), model_directory_,
         std::move(jit_compilation_options->scoped_weight_source),
         static_cast<const weight_loader::WeightInMemoryMap*>(
-            jit_compilation_options->weight_in_memory_map));
+            jit_compilation_options->weight_in_memory_map),
+        std::static_pointer_cast<weight_loader::WebWeightUploader>(
+            jit_compilation_options->web_weight_uploader));
     weight_loader_ = weight_loader_owned_.get();
   } else {
     weight_loader_ = jit_compilation_options->weight_loader;
@@ -598,7 +767,25 @@ Expected<void> LiteRtCompiledModelT::InitializeRuntime(
     // TODO(b/456318365): Handle weight access request to support multiple
     // backends.
     request.opencl = false;
-    LiteRtStatus prepare_status = weight_loader_->PrepareAccess(request, env);
+    LiteRtStatus prepare_status = kLiteRtStatusOk;
+    if (jit_compilation_options != nullptr &&
+        jit_compilation_options->weight_loader != nullptr &&
+        fb_model_ != nullptr && fb_model_->GetModel() != nullptr) {
+      const auto* ext_buffers = fb_model_->GetModel()->external_buffers();
+      if (ext_buffers != nullptr) {
+        for (const auto* ext_buf : *ext_buffers) {
+          if (ext_buf != nullptr) {
+            prepare_status = weight_loader_->PrepareAccessForBuffer(
+                ext_buf->id(), request, env);
+            if (prepare_status != kLiteRtStatusOk) {
+              break;
+            }
+          }
+        }
+      }
+    } else {
+      prepare_status = weight_loader_->PrepareAccess(request, env);
+    }
 #ifdef __EMSCRIPTEN__
     if (prepare_status != kLiteRtStatusOk) {
       LITERT_LOG(LITERT_WARNING,
@@ -671,7 +858,9 @@ Expected<void> LiteRtCompiledModelT::ResolveExternalWeightsForCompilation(
         LrtGetRuntimeContext(), tfl_wrapper.PackedModel(), model_directory_,
         std::move(jit_compilation_options->scoped_weight_source),
         static_cast<const weight_loader::WeightInMemoryMap*>(
-            jit_compilation_options->weight_in_memory_map));
+            jit_compilation_options->weight_in_memory_map),
+        std::static_pointer_cast<weight_loader::WebWeightUploader>(
+            jit_compilation_options->web_weight_uploader));
     weight_loader_ = weight_loader_owned_.get();
   }
   weight_loader::WeightAccessRequest request;
@@ -910,6 +1099,13 @@ Expected<void> LiteRtCompiledModelT::InitializeModel(
     LiteRtModelT& model, LiteRtHwAcceleratorSet hw_accelerators,
     LiteRtOptions options, LiteRtEnvironmentT& env) {
   LITERT_PERFETTO_TRACE_EVENT("CompiledModel Graph Loading");
+  // Windows charges a copy-on-write view of the model file in full; the model
+  // is written to only through MakeModelBufferWritable. Only a model for NPU
+  // has its view made read-only, because that costs initialization time.
+  if (hw_accelerators & kLiteRtHwAcceleratorNpu) {
+    litert::internal::KeepModelBufferReadOnlyUntilWritten(
+        litert::internal::GetTflFlatbuffer(model).Buf().Data());
+  }
 #if !defined(LITERT_NO_BUILTIN_OPS)
   LITERT_RETURN_IF_ERROR(
       litert::internal::ReplaceMagicNumbersIfAny(env, model));
@@ -1121,6 +1317,15 @@ LiteRtCompiledModelT::Create(LiteRtEnvironmentT* env, LiteRtModel model,
       LITERT_RETURN_IF_ERROR(scoped_modifier.Append(std::move(vendor_node)));
     }
 #endif  // !defined(LITERT_DISABLE_NPU)
+    // When only a subset of signatures is selected, tell the dispatch delegate
+    // which dispatch functions can be invoked, so that it can let the Dispatch
+    // API skip loading the others.
+    if (!compiled_model->selected_signature_keys_.empty()) {
+      LITERT_RETURN_IF_ERROR(dispatch_options.SetExpectedFunctionNames(
+          GetExpectedDispatchFunctionNames(
+              *compiled_model->interp_,
+              compiled_model->active_subgraph_indices_)));
+    }
     LITERT_RETURN_IF_ERROR(scoped_modifier.Append(std::move(dispatch_options)));
   }
 
@@ -1167,6 +1372,9 @@ LiteRtCompiledModelT::Create(LiteRtEnvironmentT* env, LiteRtModel model,
       .partitions = 0,
   };
   int cpu_delegated_node_count = 0;
+  // Hardware supported by any accelerator registered in the environment, used
+  // to explain a compilation failure when a requested accelerator is missing.
+  LiteRtHwAcceleratorSet registered_hardware = kLiteRtHwAcceleratorNone;
 
   // Apply accelerators matching the requested hardware support to the
   // model in the order they were registered.
@@ -1179,6 +1387,7 @@ LiteRtCompiledModelT::Create(LiteRtEnvironmentT* env, LiteRtModel model,
     LiteRtHwAcceleratorSet accelerator_supported_hardware;
     LITERT_RETURN_IF_ERROR(accelerator->GetHardwareSupport(
         accelerator.get(), &accelerator_supported_hardware));
+    registered_hardware |= accelerator_supported_hardware;
 
     // We don't apply the delegate if:
     //   - the delegate is responsible for JIT compilation
@@ -1288,6 +1497,43 @@ LiteRtCompiledModelT::Create(LiteRtEnvironmentT* env, LiteRtModel model,
 
   if (!(hardware_accelerators & kLiteRtHwAcceleratorCpu) &&
       prev_counts.undelegated_nodes > 0) {
+    // If none of the requested accelerators is registered in the environment,
+    // e.g. because the device is not on the GPU compatibility list, no op was
+    // delegated. Say so instead of suggesting a CPU fallback for "some" ops.
+    // When at least one requested accelerator is registered, the failure is a
+    // real partial delegation and is reported as such below.
+    const LiteRtHwAcceleratorSet requested_hardware =
+        hardware_accelerators &
+        (kLiteRtHwAcceleratorGpu | kLiteRtHwAcceleratorNpu);
+    if (requested_hardware != kLiteRtHwAcceleratorNone &&
+        (requested_hardware & registered_hardware) ==
+            kLiteRtHwAcceleratorNone) {
+      std::string names;
+      std::string hints;
+      if (requested_hardware & kLiteRtHwAcceleratorGpu) {
+        absl::StrAppend(&names, "GPU");
+        absl::StrAppend(&hints,
+                        " The GPU accelerator is not registered on devices "
+                        "that are not on the GPU compatibility list.");
+      }
+      if (requested_hardware & kLiteRtHwAcceleratorNpu) {
+        absl::StrAppend(&names, names.empty() ? "" : " or ", "NPU");
+        absl::StrAppend(&hints,
+                        " The NPU accelerator is not registered when no vendor "
+                        "dispatch library is found (see the DispatchLibraryDir "
+                        "environment option).");
+      }
+      return Error(
+          kLiteRtStatusErrorCompilation,
+          absl::StrCat(
+              "No ", names,
+              " accelerator is registered in the LiteRT environment, so the "
+              "model cannot run on it. The accelerator may be unavailable on "
+              "this device or disabled by the environment options.",
+              hints,
+              " Add kLiteRtHwAcceleratorCpu to the compilation accelerator set "
+              "to fall back to the CPU."));
+    }
     return Error(
         kLiteRtStatusErrorCompilation,
         "Some ops are not accelerated. Add kLiteRtHwAcceleratorCpu to the "
@@ -1581,6 +1827,139 @@ void LiteRtCompiledModelT::CheckCpuTensors() {
 }
 
 #if !defined(LITERT_DISABLE_NPU)
+#if !defined(LITERT_DISABLE_EXTERNAL_WEIGHTS)
+namespace {
+
+Expected<void> PrepareExternalWeightsForJit(
+    LiteRtModelT& model, LiteRtOptionsT& options, LiteRtEnvironmentT& env,
+    const std::optional<std::string>& model_directory,
+    std::unique_ptr<weight_loader::WeightLoader>& jit_weight_loader_owned,
+    std::vector<litert::internal::BufferManager::BufferId>& bound_buffer_ids,
+    std::vector<uint32_t>& prepared_external_buffer_ids) {
+  const auto* packed_model =
+      litert::internal::GetTflFlatbuffer(model).PackedModel();
+  if (packed_model == nullptr || packed_model->external_buffers() == nullptr ||
+      packed_model->external_buffers()->empty()) {
+    return {};
+  }
+
+  auto* buffers = model.Buffers();
+  std::vector<litert::internal::BufferManager::BufferId> active_ext_buffer_ids;
+  std::vector<uint8_t> seen_ext_buf(buffers->NumBuffers(), 0);
+  for (const LiteRtSubgraph& subgraph : model.Subgraphs()) {
+    for (const LiteRtTensor& tensor : subgraph->Tensors()) {
+      const auto buf_id = tensor->Weights().GetBufferId();
+      if (buf_id >= buffers->NumBuffers() || seen_ext_buf[buf_id]) {
+        continue;
+      }
+      auto ctx = buffers->GetContext(buf_id);
+      if (ctx && ctx->get().external.has_value()) {
+        seen_ext_buf[buf_id] = 1;
+        active_ext_buffer_ids.push_back(buf_id);
+      }
+    }
+  }
+  if (active_ext_buffer_ids.empty()) {
+    return {};
+  }
+
+  const bool has_explicit_weight_source =
+      options.weight_loader != nullptr ||
+      (options.scoped_weight_source != nullptr &&
+       !options.scoped_weight_source->empty()) ||
+      options.weight_in_memory_map != nullptr;
+
+  bool needs_weight_loader = has_explicit_weight_source;
+  if (!needs_weight_loader) {
+    for (const auto buf_id : active_ext_buffer_ids) {
+      auto buf = buffers->GetBuffer(buf_id);
+      if (!buf || buf->Size() == 0) {
+        needs_weight_loader = true;
+        break;
+      }
+    }
+  }
+  if (!needs_weight_loader) {
+    return {};
+  }
+
+  weight_loader::WeightLoader* loader = options.weight_loader;
+  if (loader == nullptr) {
+    std::unique_ptr<litert::ScopedWeightSource> duplicated_scoped_source;
+    litert::ScopedWeightSource* raw_dup_source = nullptr;
+    if (options.scoped_weight_source != nullptr &&
+        options.scoped_weight_source->file.IsValid()) {
+      auto dup_file = options.scoped_weight_source->file.Duplicate();
+      if (!dup_file.ok()) {
+        return Unexpected(kLiteRtStatusErrorFileIO,
+                          "Failed to duplicate scoped weight file for JIT");
+      }
+      duplicated_scoped_source = std::make_unique<litert::ScopedWeightSource>(
+          std::move(*dup_file),
+          std::move(options.scoped_weight_source->sections));
+      raw_dup_source = duplicated_scoped_source.get();
+    }
+    jit_weight_loader_owned = weight_loader::CreateLiteRtWeightLoader(
+        LrtGetRuntimeContext(), packed_model, model_directory,
+        std::move(duplicated_scoped_source),
+        static_cast<const weight_loader::WeightInMemoryMap*>(
+            options.weight_in_memory_map));
+    if (raw_dup_source != nullptr) {
+      options.scoped_weight_source->sections =
+          std::move(raw_dup_source->sections);
+    }
+    loader = jit_weight_loader_owned.get();
+  }
+
+  if (loader == nullptr || loader->GetWeightInfo().empty()) {
+    return {};
+  }
+
+  weight_loader::WeightAccessRequest request;
+  request.cpu = true;
+  for (const auto buf_id : active_ext_buffer_ids) {
+    auto ctx = buffers->GetContext(buf_id);
+    if (!ctx || !ctx->get().external.has_value()) {
+      continue;
+    }
+    const uint32_t ext_buf_id = ctx->get().external->id;
+    if (loader->FindWeightInfoByBuffer(ext_buf_id) == nullptr) {
+      continue;
+    }
+    LiteRtStatus status =
+        loader->PrepareAccessForBuffer(ext_buf_id, request, &env);
+    if (status != kLiteRtStatusOk) {
+      return Unexpected(
+          status, absl::StrCat("Failed to prepare external weight buffer ",
+                               ext_buf_id, " for JIT compilation"));
+    }
+    const weight_loader::WeightAccess* access =
+        loader->GetExternalWeightByBuffer(ext_buf_id);
+    if (access == nullptr || access->GetHostBuffer() == nullptr) {
+      return Unexpected(
+          kLiteRtStatusErrorRuntimeFailure,
+          absl::StrCat("Missing host buffer for external weight buffer ",
+                       ext_buf_id));
+    }
+    void* host_mem_addr = nullptr;
+    LITERT_RETURN_IF_ERROR(LiteRtGetTensorBufferHostMemory(
+        access->GetHostBuffer(), &host_mem_addr));
+    size_t byte_size = 0;
+    LITERT_RETURN_IF_ERROR(
+        LiteRtGetTensorBufferSize(access->GetHostBuffer(), &byte_size));
+    LITERT_RETURN_IF_ERROR(model.Buffers()->SetNonOwnedBuffer(
+        buf_id, litert::BufferRef<uint8_t>(
+                    static_cast<const uint8_t*>(host_mem_addr), byte_size)));
+    bound_buffer_ids.push_back(buf_id);
+    prepared_external_buffer_ids.push_back(ext_buf_id);
+  }
+
+  return {};
+}
+
+}  // namespace
+#endif  // !defined(LITERT_DISABLE_EXTERNAL_WEIGHTS)
+
 Expected<bool> LiteRtCompiledModelT::ApplyPluginsWithCaching(
     LiteRtModelT& model, LiteRtHwAcceleratorSet hw_accelerators,
     LiteRtOptionsT& options, LiteRtEnvironmentT& env) {
@@ -1635,8 +2014,18 @@ Expected<bool> LiteRtCompiledModelT::ApplyPluginsWithCaching(
       }
     }
   }
+#if !defined(LITERT_DISABLE_EXTERNAL_WEIGHTS)
+  std::unique_ptr<weight_loader::WeightLoader> jit_weight_loader_owned;
+  std::vector<litert::internal::BufferManager::BufferId> jit_bound_buffer_ids;
+  std::vector<uint32_t> jit_prepared_ext_buffer_ids;
+#endif  // !defined(LITERT_DISABLE_EXTERNAL_WEIGHTS)
   // Cache miss, we need to continue with JIT compilation.
   if (maybe_compiled_plugins.HasValue()) {
+#if !defined(LITERT_DISABLE_EXTERNAL_WEIGHTS)
+    LITERT_RETURN_IF_ERROR(PrepareExternalWeightsForJit(
+        model, options, env, model_directory_, jit_weight_loader_owned,
+        jit_bound_buffer_ids, jit_prepared_ext_buffer_ids));
+#endif  // !defined(LITERT_DISABLE_EXTERNAL_WEIGHTS)
     auto jit_result = litert::internal::ApplyPlugins(
         &model, hw_accelerators, maybe_compiled_plugins.Value(),
         &need_reserialization);
@@ -1662,6 +2051,14 @@ Expected<bool> LiteRtCompiledModelT::ApplyPluginsWithCaching(
     maybe_compiled_plugins_ = std::move(maybe_compiled_plugins.Value());
   }
   if (!need_reserialization) {
+#if !defined(LITERT_DISABLE_EXTERNAL_WEIGHTS)
+    if (jit_weight_loader_owned != nullptr) {
+      for (const auto buf_id : jit_bound_buffer_ids) {
+        (void)model.Buffers()->SetNonOwnedBuffer(buf_id,
+                                                 litert::BufferRef<uint8_t>());
+      }
+    }
+#endif  // !defined(LITERT_DISABLE_EXTERNAL_WEIGHTS)
     return false;
   }
   LITERT_LOG(LITERT_INFO, "JIT compilation changed model, reserializing...");
@@ -1688,6 +2085,28 @@ Expected<bool> LiteRtCompiledModelT::ApplyPluginsWithCaching(
     return Unexpected(kLiteRtStatusErrorFileIO,
                       "Failed to build flatbuffer from buffer");
   }
+#if !defined(LITERT_DISABLE_EXTERNAL_WEIGHTS)
+  if (options.weight_loader != nullptr &&
+      !jit_prepared_ext_buffer_ids.empty()) {
+    const auto* packed = fb_model_->GetModel();
+    const auto* ext_buffers =
+        packed != nullptr ? packed->external_buffers() : nullptr;
+    for (const uint32_t ext_buf_id : jit_prepared_ext_buffer_ids) {
+      bool still_referenced = false;
+      if (ext_buffers != nullptr) {
+        for (const auto* ext_buf : *ext_buffers) {
+          if (ext_buf != nullptr && ext_buf->id() == ext_buf_id) {
+            still_referenced = true;
+            break;
+          }
+        }
+      }
+      if (!still_referenced) {
+        (void)options.weight_loader->ReleaseExternalWeightByBuffer(ext_buf_id);
+      }
+    }
+  }
+#endif  // !defined(LITERT_DISABLE_EXTERNAL_WEIGHTS)
   LITERT_LOG(LITERT_DEBUG,
              "Plugins applied, flatbuffer model initialized from  JIT compiled "
              "model.");

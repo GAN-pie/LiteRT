@@ -6,11 +6,8 @@ package(default_visibility = ["//visibility:public"])
 
 py_binary(
     name = "dawn_json_generator",
-    srcs = [
-        "generator/dawn_json_generator.py",
-        "generator/generator_lib.py",
-        "generator/webgpu_docs_utility.py",
-    ],
+    # All the generator's modules: they differ between Dawn versions, e.g. a local checkout.
+    srcs = glob(["generator/*.py"]),
     imports = [
         "generator",
     ],
@@ -127,6 +124,35 @@ cc_library(
     ],
 )
 
+genrule(
+    name = "generate_webgpu_dawn_stub",
+    srcs = ["include/dawn/webgpu.h"],
+    outs = ["webgpu_dawn_stub.cc"],
+    cmd = "sed -n -E 's/.*WGPU_EXPORT .* (wgpu[A-Za-z0-9_]+)\\(.*/extern \"C\" __declspec(dllexport) void \\1() {}/p' $(location include/dawn/webgpu.h) > $@",
+    target_compatible_with = ["@platforms//os:windows"],
+)
+
+cc_binary(
+    name = "stub/webgpu_dawn.dll",
+    srcs = [":webgpu_dawn_stub.cc"],
+    linkshared = 1,
+    target_compatible_with = ["@platforms//os:windows"],
+)
+
+filegroup(
+    name = "webgpu_dawn_interface_lib",
+    srcs = [":stub/webgpu_dawn.dll"],
+    output_group = "interface_library",
+    target_compatible_with = ["@platforms//os:windows"],
+)
+
+cc_import(
+    name = "webgpu_dawn_dll_import",
+    interface_library = ":webgpu_dawn_interface_lib",
+    system_provided = 1,
+    target_compatible_with = ["@platforms//os:windows"],
+)
+
 cc_library(
     name = "webgpu_dawn",
     hdrs = [
@@ -140,20 +166,80 @@ cc_library(
         "include",
         "src",
     ],
+    linkopts = select({
+        "@platforms//os:windows": [
+            "/DELAYLOAD:webgpu_dawn.dll",
+            "delayimp.lib",
+        ],
+        "//conditions:default": [],
+    }),
     deps = [
         ":dawn_native",
         ":webgpu_headers",
+    ] + select({
+        "@platforms//os:windows": [":webgpu_dawn_dll_import"],
+        "//conditions:default": [],
+    }),
+)
+
+genrule(
+    name = "generate_dawn_version",
+    outs = ["include/dawn/dawn_version.h"],
+    cmd = "printf '%s\\n' " +
+          "'#ifndef INCLUDE_DAWN_DAWN_VERSION_H_' " +
+          "'#define INCLUDE_DAWN_DAWN_VERSION_H_' " +
+          "'#include <array>' " +
+          "'#include <cstdint>' " +
+          "'namespace dawn {' " +
+          "'static constexpr std::array<uint8_t, 20> kDawnVersion = {};' " +
+          "'}  // namespace dawn' " +
+          "'#endif  // INCLUDE_DAWN_DAWN_VERSION_H_' > $@",
+)
+
+genrule(
+    name = "generate_dawn_proc",
+    srcs = glob([
+        "generator/templates/**/*",
+    ]) + [
+        "src/dawn/dawn.json",
+        "src/dawn/dawn_wire.json",
     ],
+    outs = [
+        "src/dawn/dawn_proc.cpp",
+        "src/dawn/dawn_thread_dispatch_proc.cpp",
+    ],
+    cmd = "$(location :dawn_json_generator) " +
+          "--dawn-json $(location src/dawn/dawn.json) " +
+          "--wire-json $(location src/dawn/dawn_wire.json) " +
+          "--template-dir $$(dirname $(location generator/templates/dawn_proc.cpp)) " +
+          "--targets proc " +
+          "--output-dir $(RULEDIR)",
+    tools = [":dawn_json_generator"],
 )
 
 cc_library(
     name = "libdawn_proc",
+    srcs = [
+        "src/dawn/common/Compiler.h",
+        "src/utils/log.cc",
+        ":generate_dawn_proc",
+        ":generate_dawn_version",
+    ] + glob([
+        "src/utils/*.h",
+    ]),
     hdrs = [
         ":generate_webgpu",
     ] + glob([
         "include/**/*.h",
     ]),
+    # DAWN_HAVE_UTILS_BUILD_CONFIG is required by src/utils of newer Dawn versions, e.g. a local checkout.
+    copts = [
+        "-DDAWN_DISABLE_LOGGING",
+        "-DDAWN_HAVE_UTILS_BUILD_CONFIG",
+    ],
     includes = [
+        ".",
         "include",
+        "src",
     ],
 )

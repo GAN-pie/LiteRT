@@ -81,10 +81,42 @@ cc_library(
 )
 
 cc_library(
+    name = "dequantize",
+    srcs = ["dequantize.cc"],
+    hdrs = ["dequantize.h"],
+    deps = [
+        "//tensor:datatypes",
+        "//tensor/internal:graph",
+        "//tensor/utils:macros",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "dequantize_test",
+    srcs = ["dequantize_test.cc"],
+    deps = [
+        ":dequantize",
+        "//tensor:datatypes",
+        "//tensor/internal:graph",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "conversion",
     srcs = ["conversion.cc"],
     hdrs = ["conversion.h"],
     deps = [
+        ":dequantize",
         ":graph",
         ":utils",
         "//tensor",
@@ -132,9 +164,13 @@ cc_test(
         ":arithmetic",
         ":conversion",
         "//tensor",
+        "//tensor:arithmetic",
+        "//tensor:buffer",
+        "//tensor:datatypes",
         "//tensor/backends/testing:numerical_test_suite",
         "//tensor/runners/xnnpack:runner",
         "//tensor/utils:macros",
+        "//tensor/utils:matchers",
         "@XNNPACK",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

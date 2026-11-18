@@ -620,6 +620,7 @@ cc_library(
     srcs = ["magic_number_utils.cc"],
     hdrs = ["magic_number_utils.h"],
     deps = [
+        ":model_buffer_writes",
         "//litert/c:litert_any",
         "//litert/c:litert_common",
         "//litert/c:litert_environment_options",
@@ -636,6 +637,26 @@ cc_library(
         "//tflite/converter/schema:schema_fbs",
         "@com_google_absl//absl/strings",
         "@flatbuffers//:runtime_cc",
+    ],
+)
+
+cc_library(
+    name = "model_buffer_writes",
+    srcs = ["model_buffer_writes.cc"],
+    hdrs = ["model_buffer_writes.h"],
+    deps = [
+        "//litert/c:litert_common",
+        "//litert/c/internal:litert_logging",
+        "//litert/cc:litert_expected",
+    ],
+)
+
+cc_test(
+    name = "model_buffer_writes_test",
+    srcs = ["model_buffer_writes_test.cc"],
+    deps = [
+        ":model_buffer_writes",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
@@ -756,6 +777,7 @@ cc_library(
         ":external_litert_buffer_context",
         ":litert_runtime_options",
         ":metrics",
+        ":model_buffer_writes",
         ":profiler",
         ":tensor_buffer",
         ":tensor_buffer_requirements",
@@ -786,11 +808,13 @@ cc_library(
         "//litert/cc/internal:litert_tensor_buffer_utils",
         "//litert/core:buffer_error_reporter",
         "//litert/core:build_stamp",
+        "//litert/core:dispatch_op_schema",
         "//litert/core:environment",
         "//litert/core:error_reporter",
         "//litert/core:filesystem",
         "//litert/core:options",
         "//litert/core/model",
+        "//litert/core/model:buffer_manager",
         "//litert/core/util:flatbuffer_tools",
         "//litert/core/util:perfetto_profiling",
         "//litert/runtime/dispatch:dispatch_opaque_options",
@@ -804,6 +828,8 @@ cc_library(
         "//tflite/core:private_cc_api_stable",
         "//tflite/core/api",
         "//tflite/schema:schema_fbs",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
@@ -811,6 +837,7 @@ cc_library(
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
     ] + select({
         "//litert/build_common:build_include_npu_enabled": [
@@ -862,6 +889,7 @@ cc_test(
     # require GPU to run OpenCL tests.
     tags = ["requires-gpu-sm90"],  # OpenCL/MIG-compatible
     deps = [
+        ":accelerator",
         ":compiled_model",
         ":external_litert_buffer_context",
         ":open_cl_memory",
@@ -877,10 +905,14 @@ cc_test(
         "//litert/c:litert_profiler",
         "//litert/c:litert_tensor_buffer",
         "//litert/c:litert_tensor_buffer_types",
+        "//litert/c/internal:litert_accelerator",
+        "//litert/c/internal:litert_accelerator_registration",
+        "//litert/c/internal:litert_runtime_context_header",
         "//litert/c/internal:litert_tensor_buffer_registry",
         "//litert/c/options:litert_cpu_options",
         "//litert/c/options:litert_runtime_options",
         "//litert/cc:litert_any",
+        "//litert/cc:litert_api_types",
         "//litert/cc:litert_element_type",
         "//litert/cc:litert_environment",
         "//litert/cc:litert_expected",
@@ -894,12 +926,16 @@ cc_test(
         "//litert/cc/internal:litert_handle",
         "//litert/cc/options:litert_cpu_options",
         "//litert/cc/options:litert_runtime_options",
+        "//litert/core:build_stamp",
+        "//litert/core:dispatch_op_schema",
         "//litert/core:options",
         "//litert/core/model",
+        "//litert/runtime/dispatch:dispatch_opaque_options",
         "//litert/test:common",
         "//litert/test:matchers",
         "//litert/test:simple_model",
         "//ml_drift_delegate/delegate:buffer_handler_opencl",
+        "//tflite:builtin_ops",
         "//tflite:framework",
         "//tflite/c:c_api_opaque",
         "//tflite/c:common",
@@ -907,6 +943,7 @@ cc_test(
         "//tflite/schema:schema_fbs",
         "@com_google_absl//absl/debugging:leak_check",
         "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",

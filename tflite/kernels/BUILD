@@ -1491,6 +1491,7 @@ cc_test(
         "//tflite/core:framework_stable",
         "//tflite/core/kernels:builtin_ops",
         "//tflite/schema:schema_fbs",
+        "//tflite/types:half",
         "@com_google_googletest//:gtest",
     ],
 )
@@ -2274,6 +2275,26 @@ cc_test(
 )
 
 cc_test(
+    name = "embedding_lookup_blockwise_test",
+    size = "small",
+    srcs = ["embedding_lookup_blockwise_test.cc"],
+    deps = [
+        ":kernel_util",
+        ":reference_ops",
+        ":test_main",
+        ":test_util",
+        "//tflite/core:framework_stable",
+        "//tflite/core/c:common",
+        "//tflite/core/kernels:builtin_ops",
+        "//tflite/schema:schema_fbs",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_googletest//:gtest",
+        "@eigen_archive//:eigen3",
+        "@flatbuffers",
+    ],
+)
+
+cc_test(
     name = "embedding_lookup_sparse_test",
     size = "small",
     srcs = ["embedding_lookup_sparse_test.cc"],
@@ -2305,6 +2326,24 @@ cc_test(
         "//tflite/schema:schema_fbs",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_googletest//:gtest",
+        "@flatbuffers",
+    ],
+)
+
+cc_test(
+    name = "fully_connected_blockwise_test",
+    size = "small",
+    srcs = ["fully_connected_blockwise_test.cc"],
+    deps = [
+        ":kernel_util",
+        ":reference_ops",
+        ":test_main",
+        "//tflite/core:framework_stable",
+        "//tflite/core/c:common",
+        "//tflite/core/kernels:builtin_ops",
+        "//tflite/schema:schema_fbs",
+        "@com_google_googletest//:gtest",
+        "@eigen_archive//:eigen3",
         "@flatbuffers",
     ],
 )
@@ -3137,6 +3176,7 @@ cc_test(
         "//tflite/kernels/internal:tensor_utils",
         "//tflite/kernels/internal:types",
         "//tflite/schema:schema_fbs",
+        "//tflite/types:half",
         "@com_google_googletest//:gtest",
         "@flatbuffers",
     ],

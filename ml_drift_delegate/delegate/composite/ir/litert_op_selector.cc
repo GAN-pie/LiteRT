@@ -40,10 +40,14 @@
 #include "ml_drift_delegate/delegate/composite/glu_kernel.h"
 #include "ml_drift_delegate/delegate/composite/moe_experts_kernel.h"
 #include "ml_drift_delegate/delegate/composite/qkv_norm_rope_kernel.h"
+#include "ml_drift_delegate/delegate/composite/qsa_indexer_update_kernel.h"
+#include "ml_drift_delegate/delegate/composite/qsa_indexer_update_parser.h"
 #include "ml_drift_delegate/delegate/composite/runtime_batched_matmul_kernel.h"
 #include "ml_drift_delegate/delegate/composite/sdpa_kernel.h"
 #include "ml_drift_delegate/delegate/composite/sdpa_transposed_kernel.h"
 #include "ml_drift_delegate/delegate/composite/short_conv_step_kernel.h"
+#include "ml_drift_delegate/delegate/composite/sparse_sdpa_transposed_kernel.h"
+#include "ml_drift_delegate/delegate/composite/symmetric_quantized_fully_connected.h"
 
 namespace litert::ml_drift::ir {
 
@@ -126,7 +130,12 @@ absl::Status LiteRtOpSelector::GPUOperationFromNode(
     std::vector<::ml_drift::ValueId> src_ids(cache_inputs.size());
     for (size_t i = 0; i < cache_inputs.size(); ++i) {
       src_ids[i] = cache_inputs[i]->id;
-      cache_op_def.src_tensors[i] = cache_inputs[i]->desc;
+      // Preserve `op_def.src_tensors[i]` for unreplaced inputs: external graph
+      // inputs keep `kUnknown` storage on `IrTensor::desc` while their resolved
+      // external descriptor lives in `op_def`.
+      if (cache_inputs[i]->id != inputs[i]->id) {
+        cache_op_def.src_tensors[i] = cache_inputs[i]->desc;
+      }
     }
     std::vector<::ml_drift::ValueId> dst_ids(outputs.size());
     for (size_t i = 0; i < outputs.size(); ++i) {
@@ -191,6 +200,19 @@ absl::Status LiteRtOpSelector::GPUOperationFromNode(
     return CreateQkvNormRopeFromIrOp(inputs, outputs, op, model_builder);
   } else if (op.name == "short_conv_step") {
     return CreateShortConvStepFromIrOp(inputs, outputs, op, model_builder);
+  } else if (op.name == "qsa_indexer_update") {
+    int param_index = inputs.size() > kQsaIndexerStartPosGpuInput
+                          ? kQsaIndexerStartPosGpuInput
+                          : -1;
+    std::vector<const ::ml_drift::ir::IrTensor*> qsa_inputs =
+        ResolveInputsWithBufferParam(param_index, inputs, model_builder);
+    return CreateQsaIndexerUpdateFromIrOp(qsa_inputs, outputs, op,
+                                          model_builder);
+  } else if (op.name == "sparse_sdpa_transposed") {
+    std::vector<const ::ml_drift::ir::IrTensor*> sdpa_inputs =
+        ResolveInputsWithBufferParam(/*param_index=*/-1, inputs, model_builder);
+    return CreateSparseSdpaTransposedFromIrOp(sdpa_inputs, outputs, op,
+                                              model_builder);
   } else if (op.name ==
              ToString(::ml_drift::OperationType::kScaledDotProductAttention)) {
     // Try the custom fused Flash SDPA kernel first, and fall back to the
@@ -205,6 +227,13 @@ absl::Status LiteRtOpSelector::GPUOperationFromNode(
     }
   }
 
+  // Symmetric quantized FullyConnected binds no zero point, which ML Drift's
+  // selector expects for these ops.
+  absl::Status fc_status = CreateSymmetricQuantizedFullyConnectedFromIrOp(
+      gpu_info_, create_info_, inputs, outputs, op, model_builder);
+  if (!absl::IsUnimplemented(fc_status)) {
+    return fc_status;
+  }
   return ::ml_drift::GPUOperationFromNode(gpu_info_, op_def, create_info_,
                                           inputs, outputs, op, model_builder);
 }

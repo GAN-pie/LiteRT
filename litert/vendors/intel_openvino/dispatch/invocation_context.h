@@ -1,4 +1,4 @@
-// Copyright (C) 2025 Intel Corporation
+// Copyright (C) 2025-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,7 @@
 
 #include "openvino/core/any.hpp"
 #include "openvino/runtime/infer_request.hpp"
+#include "openvino/runtime/properties.hpp"
 #include "openvino/runtime/tensor.hpp"
 #include "absl/base/thread_annotations.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
@@ -38,6 +39,7 @@
 #include "litert/cc/options/litert_intel_openvino_options.h"
 #include "litert/vendors/c/litert_dispatch.h"
 #include "litert/vendors/intel_openvino/dispatch/device_context.h"
+#include "litert/vendors/intel_openvino/hfa_history.h"
 
 class LiteRtDispatchDeviceContextT;
 
@@ -168,6 +170,9 @@ class LiteRtDispatchInvocationContextT {
   // inputs; held for the infer request's lifetime (set_input_tensor does not
   // take ownership).
   std::vector<ov::Tensor> bound_weights_;
+  // Set on a prefill graph whose attention enable_hfa decomposed: writes
+  // NPUW's HFA history before every inference. Belongs to infer_request_.
+  std::optional<litert::openvino::HfaHistoryReporter> hfa_history_;
 
   // The import inputs, kept verbatim so EnsureImported() can do the whole job
   // later. Nothing derived from them is cached: the container parse and device
@@ -211,6 +216,13 @@ class LiteRtDispatchInvocationContextT {
 #if defined(__ANDROID__)
   void* ctx = nullptr;
 #endif
+  // Last priority requested from the compiled model, whether or not the plugin
+  // accepted it, so an unchanged request or a plugin that rejects the property
+  // is not retried on every inference. Not synchronized: like ctx and the infer
+  // request it is only used by Invoke(), one call at a time per context, and
+  // cleared on release under the exclusive use_mutex_. Declared on every
+  // platform because ReleaseImportedLocked() clears it on every platform.
+  std::optional<ov::hint::Priority> requested_model_priority_;
 };
 
 #endif  // ODML_LITERT_LITERT_VENDORS_OPENVINO_DISPATCH_LITERT_DISPATCH_INVOCATION_CONTEXT_H_

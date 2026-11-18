@@ -32,11 +32,13 @@ cc_library(
     hdrs = [
         "options.h",
         "//litert/c:litert_custom_op_kernel.h",
+        "//litert/c:litert_op_resolver.h",
         "//litert/c:litert_options.h",
     ],
     deps = [
         "//litert/c:litert_common",
         "//litert/c:litert_layout",
+        "//litert/c:litert_op_resolver",
         "//litert/cc/internal:scoped_weight_source",
     ],
 )
@@ -336,12 +338,43 @@ cc_test(
     ],
 )
 
+cc_library(
+    name = "litert_options_encoder",
+    srcs = ["litert_options_encoder.cc"],
+    hdrs = ["litert_options_encoder.h"],
+    deps = [
+        "//litert/cc:litert_common",
+        "//litert/cc:litert_expected",
+        "//litert/cc:litert_macros",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "litert_options_encoder_test",
+    srcs = ["litert_options_encoder_test.cc"],
+    deps = [
+        ":litert_options_encoder",
+        ":litert_toml_parser",
+        "//litert/c:litert_common",
+        "//litert/cc:litert_common",
+        "//litert/test:matchers",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 # Files that make up the LiteRT C++ SDK.
 #
 # lint IfChange(litert_cc_sdk_files)
 filegroup(
     name = "litert_cc_sdk_files",
     srcs = [
+        "litert_options_encoder.cc",
+        "litert_options_encoder.h",
         "litert_toml_parser.cc",
         "litert_toml_parser.h",
         "options.h",

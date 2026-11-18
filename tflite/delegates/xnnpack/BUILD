@@ -241,6 +241,7 @@ cc_library(
     deps = [
         ":file_util",
         ":flexbuffers_util",
+        ":mmap_handle",
         ":moe_delegate_kernel",
         ":quantization_util",
         ":tflite_with_xnnpack_dynamic_fully_connected",  # buildcleaner: keep
@@ -293,6 +294,7 @@ cc_library(
     deps = [
         ":file_util",
         ":flexbuffers_util",
+        ":mmap_handle",
         ":moe_delegate_kernel",
         ":quantization_util",
         ":weight_cache",
@@ -1388,6 +1390,7 @@ cc_test(
         "//tflite:framework",
         "//tflite/core:framework",
         "//tflite/core/c:common",
+        "@XNNPACK",
         "@com_google_googletest//:gtest",
         "@flatbuffers//:runtime_cc",
     ],

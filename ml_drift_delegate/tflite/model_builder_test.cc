@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <numeric>
 #include <utility>
 #include <vector>
 
@@ -50,9 +51,11 @@
 namespace litert::ml_drift {
 namespace {
 
-using absl_testing::StatusIs;
-using testing::_;
-using testing::HasSubstr;
+using ::absl_testing::StatusIs;
+using ::testing::_;
+using ::testing::ElementsAre;
+using ::testing::ElementsAreArray;
+using ::testing::HasSubstr;
 
 class DelegatedInterpreter {
  public:
@@ -2546,6 +2549,77 @@ TEST_F(Conv2DOperationParserTest, ParseWithSharedTensorsWorks) {
                                      .global_id = kGlobalId,
                                      .dequant_forced = false};
   EXPECT_EQ(shared_tensor_map.at(kWeightsValueId), kExpected);
+}
+
+// A grouped convolution whose per-group channel counts are not multiples of 4
+// is replaced with SPLIT -> one CONVOLUTION_2D per group -> CONCAT.
+TEST_F(Conv2DOperationParserTest, ParseSplitsGroupedConvIntoPerGroupConvs) {
+  // 2 groups, each mapping 5 input channels to 3 output channels with a 1x2
+  // kernel.
+  auto context = std::make_unique<StubTfLiteContext>(
+      kTfLiteBuiltinConv2d,
+      /*op_version=*/5,
+      /*num_inputs=*/3,
+      /*shape=*/std::vector<int>({1, 1, 1, 1}));
+  context->ChangeTensorShape(1, {1, 1, 2, 10});  // input (BHWC)
+  context->ChangeTensorShape(2, {6, 1, 2, 5});   // filter (OHWI)
+  context->ChangeTensorShape(3, {6});            // bias
+  context->ChangeTensorShape(4, {1, 1, 1, 6});   // output (BHWC)
+  context->SetTensorType(2, kTfLiteFloat32, kTfLiteMmapRo);
+  context->SetTensorType(3, kTfLiteFloat32, kTfLiteMmapRo);
+  constexpr size_t kWeightsPerGroup = 3 * 1 * 2 * 5;
+  const absl::Span<float> filter(context->tensor(2)->data.f,
+                                 2 * kWeightsPerGroup);
+  std::iota(filter.begin(), filter.end(), 0.0f);
+  const absl::Span<float> bias(context->tensor(3)->data.f, 6);
+  std::iota(bias.begin(), bias.end(), 100.0f);
+  TfLiteConvParams* const tf_options =
+      static_cast<TfLiteConvParams*>(context->node()->builtin_data);
+  tf_options->stride_width = 1;
+  tf_options->stride_height = 1;
+  tf_options->dilation_width_factor = 1;
+  tf_options->dilation_height_factor = 1;
+  tf_options->padding = kTfLitePaddingValid;
+  tf_options->activation = kTfLiteActNone;
+  auto parser = NewOperationParser(context->node(), context->registration());
+  ASSERT_OK(parser->IsSupported(context.get(), context->node(),
+                                context->registration()));
+
+  ::ml_drift::GraphFloat32 graph;
+  absl::flat_hash_map<int, ::ml_drift::Value*> tensor_to_value;
+  ObjectReader reader(&graph, context.get(), context->node(), &tensor_to_value);
+  parser->Parse(context->node(), context->registration(), &graph, &reader);
+
+  const std::vector<::ml_drift::Node*> nodes = graph.nodes();
+  ASSERT_EQ(nodes.size(), 4);
+  ASSERT_EQ(nodes[0]->operation.type,
+            ToString(::ml_drift::OperationType::kSplit));
+  ASSERT_EQ(nodes[1]->operation.type,
+            ToString(::ml_drift::OperationType::kConvolution2D));
+  ASSERT_EQ(nodes[2]->operation.type,
+            ToString(::ml_drift::OperationType::kConvolution2D));
+  ASSERT_EQ(nodes[3]->operation.type,
+            ToString(::ml_drift::OperationType::kConcat));
+  const auto& conv0 = std::any_cast<const ::ml_drift::Convolution2DAttributes&>(
+      nodes[1]->operation.attributes);
+  const auto& conv1 = std::any_cast<const ::ml_drift::Convolution2DAttributes&>(
+      nodes[2]->operation.attributes);
+  EXPECT_EQ(conv0.groups, 1);
+  EXPECT_EQ(conv1.groups, 1);
+  // The filter and the per-group weights are both OHWI, so each group takes
+  // one contiguous block of the filter's output channels.
+  const auto& weights0 = ::ml_drift::GetFloatWeights(conv0);
+  const auto& weights1 = ::ml_drift::GetFloatWeights(conv1);
+  ASSERT_EQ(weights0.shape, ::ml_drift::OHWI(3, 1, 2, 5));
+  ASSERT_EQ(weights1.shape, ::ml_drift::OHWI(3, 1, 2, 5));
+  ASSERT_GE(weights0.data.size(), kWeightsPerGroup);
+  ASSERT_GE(weights1.data.size(), kWeightsPerGroup);
+  EXPECT_THAT(absl::MakeConstSpan(weights0.data).first(kWeightsPerGroup),
+              ElementsAreArray(filter.first(kWeightsPerGroup)));
+  EXPECT_THAT(absl::MakeConstSpan(weights1.data).first(kWeightsPerGroup),
+              ElementsAreArray(filter.last(kWeightsPerGroup)));
+  EXPECT_THAT(conv0.bias.data, ElementsAre(100.0f, 101.0f, 102.0f));
+  EXPECT_THAT(conv1.bias.data, ElementsAre(103.0f, 104.0f, 105.0f));
 }
 
 TEST(DepthwiseConvolutionOperationParserTest, TestIsSupported) {
@@ -5404,6 +5478,201 @@ TEST(EmbeddingLookupOperationParserTest,
       parser->IsSupported(context.get(), context->node(),
                           context->registration()),
       StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("constant")));
+}
+
+TEST(EmbeddingLookupOperationParserTest,
+     TestIsSupportedFailsNonSharedBlockwiseQuantizedWeights) {
+  for (TfLiteType weights_type : {kTfLiteInt8, kTfLiteInt4, kTfLiteInt2}) {
+    auto context = std::make_unique<StubTfLiteContext>(
+        kTfLiteBuiltinEmbeddingLookup,
+        /*op_version=*/1,
+        /*num_inputs=*/2,
+        /*shape=*/std::vector<int>({1, 1, 1, 1}));
+    // Tensor 0: blockwise quantization scale tensor.
+    context->ChangeTensorShape(0, {3, 2});
+    context->SetTensorType(0, kTfLiteFloat32, kTfLiteMmapRo);
+    // Tensor 1: indices input.
+    context->ChangeTensorShape(1, {1});
+    context->SetTensorType(1, kTfLiteInt32, kTfLiteArenaRw);
+    // Tensor 2: blockwise-quantized weights without shared buffer ID.
+    context->ChangeTensorShape(2, {3, 64});
+    context->SetTensorType(2, weights_type, kTfLiteMmapRo);
+    TfLiteTensor* weights_tensor = context->tensor(2);
+    weights_tensor->quantization.type = kTfLiteBlockwiseQuantization;
+    auto quant_params = std::make_unique<TfLiteBlockwiseQuantization>();
+    quant_params->scale = 0;
+    quant_params->zero_point = -1;
+    quant_params->blocksize = 32;
+    quant_params->quantized_dimension = 0;
+    weights_tensor->quantization.params = quant_params.release();
+    // Tensor 3: output.
+    context->ChangeTensorShape(3, {1, 64});
+
+    auto parser = NewOperationParser(context->node(), context->registration());
+    EXPECT_THAT(
+        parser->IsSupported(context.get(), context->node(),
+                            context->registration()),
+        StatusIs(absl::StatusCode::kInvalidArgument,
+                 HasSubstr("Use external weights for blockwise quantization")));
+  }
+}
+
+TEST(EmbeddingLookupOperationParserTest,
+     TestIsSupportedSucceedsNonSharedAffineQuantizedWeights) {
+  for (TfLiteType weights_type : {kTfLiteInt8, kTfLiteInt4, kTfLiteInt2}) {
+    auto context = std::make_unique<StubTfLiteContext>(
+        kTfLiteBuiltinEmbeddingLookup,
+        /*op_version=*/1,
+        /*num_inputs=*/2,
+        /*shape=*/std::vector<int>({1, 1, 1, 1}));
+    context->ChangeTensorShape(1, {1});
+    context->SetTensorType(1, kTfLiteInt32, kTfLiteArenaRw);
+    context->ChangeTensorShape(2, {3, 4});
+    context->QuantizeTensor(2, weights_type);
+    context->SetTensorType(2, weights_type, kTfLiteMmapRo);
+    context->ChangeTensorShape(3, {1, 4});
+
+    auto parser = NewOperationParser(context->node(), context->registration());
+    EXPECT_OK(parser->IsSupported(context.get(), context->node(),
+                                  context->registration()));
+  }
+}
+
+class InterpreterEmbeddingLookupInt4Blockwise : public DelegatedInterpreter {
+ public:
+  explicit InterpreterEmbeddingLookupInt4Blockwise(
+      size_t buffer_identifier = kTfLiteNoBufferIdentifier,
+      size_t external_buffer_id = kTfLiteNoBufferIdentifier)
+      : DelegatedInterpreter(1),
+        weights_data_(100 * 64 / 2, 0),
+        scale_data_(100 * 2, 1.0f) {
+    EXPECT_EQ(interpreter_.AddTensors(4), kTfLiteOk);
+    EXPECT_EQ(interpreter_.SetInputs({0}), kTfLiteOk);
+    EXPECT_EQ(interpreter_.SetOutputs({3}), kTfLiteOk);
+
+    TfLiteRegistration reg_op{};
+    reg_op.builtin_code = kTfLiteBuiltinEmbeddingLookup;
+    reg_op.version = 1;
+    EXPECT_EQ(interpreter_.AddNodeWithParameters(
+                  /*inputs=*/{0, 1}, /*outputs=*/{3}, /*init_data=*/nullptr,
+                  /*init_data_size=*/0, /*builtin_data=*/nullptr,
+                  /*registration=*/&reg_op),
+              kTfLiteOk);
+
+    const std::vector<int> indices_dims = {10};
+    const std::vector<int> weights_dims = {100, 64};
+    const std::vector<int> scale_dims = {100, 2};
+    const std::vector<int> output_dims = {10, 64};
+
+    TfLiteQuantization no_quantization{};
+    no_quantization.type = kTfLiteNoQuantization;
+
+    EXPECT_EQ(interpreter_.SetTensorParametersReadWrite(
+                  0, TfLiteType::kTfLiteInt32, "indices", indices_dims,
+                  no_quantization, false),
+              kTfLiteOk);
+
+    EXPECT_EQ(
+        interpreter_.primary_subgraph().SetTensorParametersReadOnly(
+            2, TfLiteType::kTfLiteFloat32, "scale", scale_dims, no_quantization,
+            reinterpret_cast<const char*>(scale_data_.data()),
+            scale_data_.size() * sizeof(float)),
+        kTfLiteOk);
+
+    TfLiteQuantization blockwise_quantization{};
+    blockwise_quantization.type = kTfLiteBlockwiseQuantization;
+    auto* blockwise_params = static_cast<TfLiteBlockwiseQuantization*>(
+        malloc(sizeof(TfLiteBlockwiseQuantization)));
+    blockwise_params->scale = 2;
+    blockwise_params->zero_point = -1;
+    blockwise_params->blocksize = 32;
+    blockwise_params->quantized_dimension = 0;
+    blockwise_quantization.params = blockwise_params;
+
+    EXPECT_EQ(interpreter_.primary_subgraph().SetTensorParametersReadOnly(
+                  1, TfLiteType::kTfLiteInt4, "weights", weights_dims,
+                  blockwise_quantization, weights_data_.data(),
+                  weights_data_.size(), /*allocation=*/nullptr,
+                  /*sparsity=*/nullptr, buffer_identifier, external_buffer_id),
+              kTfLiteOk);
+
+    EXPECT_EQ(interpreter_.SetTensorParametersReadWrite(
+                  3, TfLiteType::kTfLiteFloat32, "output", output_dims,
+                  no_quantization, false),
+              kTfLiteOk);
+
+    exec_plan()->data[0] = 0;
+  }
+
+ private:
+  std::vector<char> weights_data_;
+  std::vector<float> scale_data_;
+};
+
+TEST(EmbeddingLookupOperationParserTest,
+     TestIsSupportedAndGetOpsToReplaceBlockwiseQuantizedSubgraphSharing) {
+  // 1. Non-shared blockwise-int4 EMBEDDING_LOOKUP: IsSupported rejects the op
+  // and GetOpsToReplace excludes it so TFLite falls back to CPU instead of
+  // aborting in Parse().
+  {
+    auto interpreter_holder =
+        std::make_unique<InterpreterEmbeddingLookupInt4Blockwise>();
+    static InterpreterEmbeddingLookupInt4Blockwise* non_shared_interpreter =
+        nullptr;
+    non_shared_interpreter = interpreter_holder.get();
+    TfLiteContext* context = non_shared_interpreter->context();
+    context->GetExecutionPlan = [](struct TfLiteContext*,
+                                   TfLiteIntArray** execution_plan) {
+      *execution_plan = non_shared_interpreter->exec_plan();
+      return kTfLiteOk;
+    };
+    context->GetNodeAndRegistration = [](struct TfLiteContext*, int node_index,
+                                         TfLiteNode** node,
+                                         TfLiteRegistration** registration) {
+      *node = non_shared_interpreter->node(node_index);
+      *registration = non_shared_interpreter->registration(node_index);
+      return kTfLiteOk;
+    };
+
+    auto parser = NewOperationParser(non_shared_interpreter->node(0),
+                                     non_shared_interpreter->registration(0));
+    EXPECT_THAT(
+        parser->IsSupported(context, non_shared_interpreter->node(0),
+                            non_shared_interpreter->registration(0)),
+        StatusIs(absl::StatusCode::kInvalidArgument,
+                 HasSubstr("Use external weights for blockwise quantization")));
+
+    TfLiteIntArray* ops_to_replace = GetOpsToReplace(context);
+    ASSERT_NE(ops_to_replace, nullptr);
+    EXPECT_EQ(ops_to_replace->size, 0);
+    TfLiteIntArrayFree(ops_to_replace);
+
+    non_shared_interpreter = nullptr;
+  }
+
+  // 2. Shared buffer_identifier: IsSupported accepts the op.
+  {
+    InterpreterEmbeddingLookupInt4Blockwise shared_interpreter(
+        /*buffer_identifier=*/100,
+        /*external_buffer_id=*/kTfLiteNoBufferIdentifier);
+    auto parser = NewOperationParser(shared_interpreter.node(0),
+                                     shared_interpreter.registration(0));
+    EXPECT_OK(parser->IsSupported(shared_interpreter.context(),
+                                  shared_interpreter.node(0),
+                                  shared_interpreter.registration(0)));
+  }
+
+  // 3. External buffer ID: IsSupported accepts the op.
+  {
+    InterpreterEmbeddingLookupInt4Blockwise external_interpreter(
+        /*buffer_identifier=*/kTfLiteNoBufferIdentifier,
+        /*external_buffer_id=*/200);
+    auto parser = NewOperationParser(external_interpreter.node(0),
+                                     external_interpreter.registration(0));
+    EXPECT_OK(parser->IsSupported(external_interpreter.context(),
+                                  external_interpreter.node(0),
+                                  external_interpreter.registration(0)));
+  }
 }
 
 enum class NormType { kGroupNorm, kLayerNorm };

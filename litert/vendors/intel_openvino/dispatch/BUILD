@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//litert/build_common:litert_build_defs.bzl", "litert_bin", "litert_dynamic_lib", "litert_lib")
@@ -21,6 +22,33 @@ package(
     # copybara:uncomment default_applicable_licenses = ["@org_tensorflow//tensorflow:license"],
     default_visibility = ["//litert:litert_internal_users"],
 )
+
+# Reporting inference to the NPU HAL through libnpu_hal_hook.so and applying the
+# NPU HAL-resolved model priority. On by default. Build with
+# `--//litert/vendors/intel_openvino/dispatch:enable_npu_hal=false` for a
+# dispatch library that never loads or calls the hook, e.g. one that is used
+# behind a service that does the scheduling itself.
+bool_flag(
+    name = "enable_npu_hal",
+    build_setting_default = True,
+)
+
+config_setting(
+    name = "npu_hal_disabled",
+    flag_values = {":enable_npu_hal": "False"},
+)
+
+NPU_HAL_COPTS = select({
+    ":npu_hal_disabled": ["-DLITERT_INTEL_OPENVINO_DISABLE_NPU_HAL"],
+    "//conditions:default": [],
+})
+
+# MSVC-style compilers (cl.exe, clang-cl) enable C++ exceptions with /EHsc;
+# -fexceptions is not an MSVC flag.
+_EXCEPTIONS_COPTS = select({
+    "//litert/runtime/dispatch:windows_msvc": ["/EHsc"],
+    "//conditions:default": ["-fexceptions"],
+})
 
 litert_dynamic_lib(
     name = "dispatch_api",
@@ -63,7 +91,7 @@ litert_dynamic_lib(
             "-Wno-sign-compare",
         ],
         "//conditions:default": [],
-    }),
+    }) + NPU_HAL_COPTS,
     export_litert_only = True,
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     linkopts = litert_android_linkopts() + [
@@ -96,12 +124,13 @@ litert_dynamic_lib(
         "//litert/c/options:litert_intel_openvino_options",
         "//litert/cc:litert_expected",
         "//litert/cc:litert_macros",
+        "//litert/cc:litert_ranked_tensor_type",
         "//litert/cc/internal:litert_context_wrapper",
         "//litert/cc/internal:litert_options_wrapper",
         "//litert/cc/options:litert_intel_openvino_options",
-        "//litert/core/util:tensor_type_util",
         "//litert/vendors/c:litert_dispatch_c_api",
         "//litert/vendors/intel_openvino:bytecode_header",
+        "//litert/vendors/intel_openvino:hfa_history",
         "//litert/vendors/intel_openvino:openvino_version_info",
         "//litert/vendors/intel_openvino:ov_utils",
         "//litert/vendors/intel_openvino/compiler:global_graph",
@@ -115,7 +144,7 @@ litert_dynamic_lib(
 )
 
 litert_bin(
-    name = "LiteRtDispatch",
+    name = "LiteRtDispatch_IntelOpenvino",
     srcs = [
         "device_context.cc",
         "dispatch_api.cc",
@@ -128,7 +157,7 @@ litert_bin(
         "@platforms//os:windows": ["mapped_pages_win.cc"],
         "//conditions:default": ["mapped_pages_linux.cc"],
     }),
-    copts = ["-fexceptions"] + select({
+    copts = _EXCEPTIONS_COPTS + select({
         "//litert/runtime/dispatch:windows_msvc": [
             "/DLITERT_COMPILE_LIBRARY",
             "/wd4018",  # -Wno-sign-compare
@@ -138,10 +167,15 @@ litert_bin(
             "-Wno-sign-compare",
         ],
         "//conditions:default": [],
-    }),
+    }) + NPU_HAL_COPTS,
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     linkopts = litert_android_linkopts(),
     linkshared = 1,
+    tags = [
+        "nobuilder",
+        "notap",
+        "windows",
+    ],
     visibility = ["//visibility:public"],  # Allows LiteRT-LM packaging.
     deps = [
         ":litert_dispatch_api",
@@ -163,14 +197,15 @@ litert_bin(
         "//litert/cc:litert_environment_options",
         "//litert/cc:litert_expected",
         "//litert/cc:litert_macros",
+        "//litert/cc:litert_ranked_tensor_type",
         "//litert/cc/internal:litert_context_wrapper",
         "//litert/cc/internal:litert_handle",
         "//litert/cc/internal:litert_opaque_options_wrapper",
         "//litert/cc/internal:litert_options_wrapper",
         "//litert/cc/options:litert_intel_openvino_options",
-        "//litert/core/util:tensor_type_util",
         "//litert/vendors/c:litert_dispatch_c_api",
         "//litert/vendors/intel_openvino:bytecode_header",
+        "//litert/vendors/intel_openvino:hfa_history",
         "//litert/vendors/intel_openvino:openvino_version_info",
         "//litert/vendors/intel_openvino:ov_utils",
         "//litert/vendors/intel_openvino/compiler:global_graph",
@@ -181,6 +216,12 @@ litert_bin(
         "@com_google_absl//absl/synchronization",
         "@intel_openvino//:openvino",
     ],
+)
+
+alias(
+    name = "LiteRtDispatch",
+    actual = ":LiteRtDispatch_IntelOpenvino",
+    visibility = ["//visibility:public"],
 )
 
 litert_lib(
@@ -195,7 +236,7 @@ litert_lib(
         "openvino_tensor_buffer.h",
         "weight_bank_runtime.h",
     ],
-    copts = ["-fexceptions"],
+    copts = _EXCEPTIONS_COPTS,
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     deps = [
         "//litert/c:litert_common",
@@ -210,9 +251,9 @@ litert_lib(
         "//litert/cc:litert_expected",
         "//litert/cc:litert_macros",
         "//litert/cc/options:litert_intel_openvino_options",
-        "//litert/core/util:tensor_type_util",
         "//litert/vendors/c:litert_dispatch_c_api",
         "//litert/vendors/intel_openvino:bytecode_header",
+        "//litert/vendors/intel_openvino:hfa_history",
         "//litert/vendors/intel_openvino:ov_utils",
         "//litert/vendors/intel_openvino/compiler:global_graph",
         "@com_google_absl//absl/base:core_headers",
@@ -282,9 +323,11 @@ cc_test(
         "//litert/c:litert_custom_tensor_buffer",
         "//litert/c:litert_layout",
         "//litert/c:litert_model_types",
+        "//litert/c:litert_tensor_buffer_header",
         "//litert/c:litert_tensor_buffer_types",
         "//litert/c/internal:litert_abi_header",
         "//litert/c/internal:litert_custom_tensor_buffer_handlers_def",
+        "//litert/c/internal:litert_runtime_context_header",
         "//litert/cc:litert_layout",
         "//litert/vendors/c:litert_dispatch_c_api",
         "@com_google_googletest//:gtest_main",

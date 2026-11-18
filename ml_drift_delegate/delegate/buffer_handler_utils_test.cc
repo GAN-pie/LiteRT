@@ -15,11 +15,12 @@
 #include "ml_drift_delegate/delegate/buffer_handler_utils.h"
 
 #include <cstdint>
-#include <utility>
 #include <vector>
 
 #include "testing/base/public/gmock.h"
 #include "testing/base/public/gunit.h"
+#include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_matchers.h"  // from @com_google_absl
 #include "ml_drift/common/data_type.h"  // from @ml_drift
 #include "ml_drift/common/task/tensor_desc.h"  // from @ml_drift
 #include "litert/c/litert_model_types.h"
@@ -62,35 +63,6 @@ TEST(BufferHandlerUtilsTest, CreateTensorDescriptorRank4Float16) {
       tensor_type, kLiteRtTensorBufferTypeMetalBufferFp16);
   ASSERT_TRUE(desc.ok());
   EXPECT_THAT(desc->GetDataType(), Eq(::ml_drift::DataType::kFloat16));
-  EXPECT_THAT(desc->GetStorageType(),
-              Eq(::ml_drift::TensorStorageType::kBuffer));
-}
-
-TEST(BufferHandlerUtilsTest, CreateTensorDescriptorInt32WithFloat16Buffer) {
-  LiteRtRankedTensorType tensor_type;
-  tensor_type.layout.rank = 2;
-  tensor_type.layout.dimensions[0] = 3;
-  tensor_type.layout.dimensions[1] = 4;
-  tensor_type.element_type = kLiteRtElementTypeInt32;
-
-  auto desc = CreateTensorDescriptor(
-      tensor_type, kLiteRtTensorBufferTypeOpenClBufferFp16);
-  ASSERT_TRUE(desc.ok());
-  EXPECT_THAT(desc->GetDataType(), Eq(::ml_drift::DataType::kInt32));
-  EXPECT_THAT(desc->GetStorageType(),
-              Eq(::ml_drift::TensorStorageType::kBuffer));
-}
-
-TEST(BufferHandlerUtilsTest, CreateTensorDescriptorBoolWithFloat16Buffer) {
-  LiteRtRankedTensorType tensor_type;
-  tensor_type.layout.rank = 1;
-  tensor_type.layout.dimensions[0] = 8;
-  tensor_type.element_type = kLiteRtElementTypeBool;
-
-  auto desc = CreateTensorDescriptor(
-      tensor_type, kLiteRtTensorBufferTypeOpenClBufferFp16);
-  ASSERT_TRUE(desc.ok());
-  EXPECT_THAT(desc->GetDataType(), Eq(::ml_drift::DataType::kBool));
   EXPECT_THAT(desc->GetStorageType(),
               Eq(::ml_drift::TensorStorageType::kBuffer));
 }
@@ -459,32 +431,72 @@ TEST(BufferHandlerUtilsTest, ConvertDataFromDescriptorUInt16) {
   EXPECT_THAT(host_data[7], Eq(8));
 }
 
-TEST(BufferHandlerUtilsTest, ToMlDriftDataTypeAllSupportedTypes) {
-  const std::vector<std::pair<LiteRtElementType, ::ml_drift::DataType>>
-      kTestCases = {
-          {kLiteRtElementTypeFloat32, ::ml_drift::DataType::kFloat32},
-          {kLiteRtElementTypeFloat16, ::ml_drift::DataType::kFloat16},
-          {kLiteRtElementTypeInt32, ::ml_drift::DataType::kInt32},
-          {kLiteRtElementTypeInt64, ::ml_drift::DataType::kInt64},
-          {kLiteRtElementTypeUInt32, ::ml_drift::DataType::kUint32},
-          {kLiteRtElementTypeUInt64, ::ml_drift::DataType::kUint64},
-          {kLiteRtElementTypeInt16, ::ml_drift::DataType::kInt16},
-          {kLiteRtElementTypeUInt16, ::ml_drift::DataType::kUint16},
-          {kLiteRtElementTypeInt8, ::ml_drift::DataType::kInt8},
-          {kLiteRtElementTypeUInt8, ::ml_drift::DataType::kUint8},
-          {kLiteRtElementTypeBool, ::ml_drift::DataType::kBool},
-      };
-  for (const auto& [element_type, expected_data_type] : kTestCases) {
-    auto status_or = ToMlDriftDataType(element_type);
-    ASSERT_TRUE(status_or.ok());
-    EXPECT_EQ(*status_or, expected_data_type);
+TEST(BufferHandlerUtilsTest, CreateAndConvertInt4BufferPackedBytes) {
+  LiteRtRankedTensorType tensor_type;
+  tensor_type.layout.rank = 4;
+  tensor_type.layout.dimensions[0] = 1;
+  tensor_type.layout.dimensions[1] = 2;
+  tensor_type.layout.dimensions[2] = 16;
+  tensor_type.layout.dimensions[3] = 16;
+  tensor_type.element_type = kLiteRtElementTypeInt4;
+
+  // Non-buffer storage is rejected for 4-bit tensors.
+  EXPECT_FALSE(CreateTensorDescriptor(
+                   tensor_type, kLiteRtTensorBufferTypeOpenClTexture)
+                   .ok());
+
+  auto desc = CreateTensorDescriptor(tensor_type,
+                                     kLiteRtTensorBufferTypeOpenClBuffer);
+  ASSERT_TRUE(desc.ok());
+  EXPECT_THAT(desc->GetDataType(), Eq(::ml_drift::DataType::kUint8));
+  EXPECT_THAT(desc->GetStorageType(),
+              Eq(::ml_drift::TensorStorageType::kBuffer));
+  // 1 * 2 * 16 * 16 = 512 int4 elements = 256 packed bytes.
+  EXPECT_THAT(desc->GetMemorySizeInBytes(), Eq(256));
+
+  std::vector<uint8_t> host_in(256);
+  for (int i = 0; i < 256; ++i) {
+    host_in[i] = static_cast<uint8_t>((i * 13 + 7) & 0xFF);
   }
+  ConvertDataToDescriptor(host_in.data(), *desc, kLiteRtElementTypeInt4);
+  ASSERT_EQ(desc->GetData().size(), 256);
+
+  std::vector<uint8_t> host_out(256, 0);
+  ConvertDataFromDescriptor(*desc, host_out.data(), kLiteRtElementTypeInt4);
+  EXPECT_EQ(host_out, host_in);
 }
 
-TEST(BufferHandlerUtilsTest, ToMlDriftDataTypeUnsupported) {
-  EXPECT_FALSE(ToMlDriftDataType(kLiteRtElementTypeNone).ok());
-  EXPECT_FALSE(ToMlDriftDataType(kLiteRtElementTypeComplex64).ok());
+TEST(BufferHandlerUtilsTest, CreateAndConvertInt4OddElementCount) {
+  LiteRtRankedTensorType tensor_type;
+  tensor_type.layout.rank = 1;
+  tensor_type.layout.dimensions[0] = 5;  // 5 nibbles -> 3 packed host bytes
+  tensor_type.element_type = kLiteRtElementTypeInt4;
+
+  auto desc =
+      CreateTensorDescriptor(tensor_type, kLiteRtTensorBufferTypeMetalBuffer);
+  ASSERT_TRUE(desc.ok());
+  EXPECT_THAT(desc->GetMemorySizeInBytes(), Eq(4));
+
+  std::vector<uint8_t> host_in = {0x12, 0x34, 0x05};
+  ConvertDataToDescriptor(host_in.data(), *desc, kLiteRtElementTypeInt4);
+
+  std::vector<uint8_t> host_out(3, 0xFF);
+  ConvertDataFromDescriptor(*desc, host_out.data(), kLiteRtElementTypeInt4);
+  EXPECT_EQ(host_out, host_in);
 }
 
+TEST(BufferHandlerUtilsTest, RejectsOverflowingInt4Dimensions) {
+  LiteRtRankedTensorType tensor_type;
+  tensor_type.layout.rank = 4;
+  tensor_type.layout.dimensions[0] = 1 << 20;
+  tensor_type.layout.dimensions[1] = 1 << 20;
+  tensor_type.layout.dimensions[2] = 1 << 24;
+  tensor_type.layout.dimensions[3] = 1;
+  tensor_type.element_type = kLiteRtElementTypeInt4;
+
+  EXPECT_THAT(
+      CreateTensorDescriptor(tensor_type, kLiteRtTensorBufferTypeOpenClBuffer),
+      ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+}
 }  // namespace
 }  // namespace litert::ml_drift

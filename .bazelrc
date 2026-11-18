@@ -180,6 +180,8 @@ build:android --dynamic_mode=off
 build:android --define=xnn_enable_avxvnniint8=false
 # TODO: Remove once Android NDK clang supports SVE2 inline asm.
 build:android --define=xnn_enable_arm_sve2=false
+# TODO: Remove once Android NDK clang is upgraded to Clang 20+.
+build:android --define=xnn_enable_arm_sme_acle=false
 
 # Sets the default Apple platform to macOS.
 build:macos --apple_platform_type=macos
@@ -207,6 +209,8 @@ build:apple-toolchain --apple_crosstool_top=@local_config_apple_cc//:toolchain
 build:apple-toolchain --crosstool_top=@local_config_apple_cc//:toolchain
 build:apple-toolchain --host_crosstool_top=@local_config_apple_cc//:toolchain
 build:apple-toolchain --xcode_version_config=@local_config_xcode//:host_xcodes
+# TODO: Remove once Xcode AppleClang supports ARM SME ACLE (LLVM 20+).
+build:apple-toolchain --define=xnn_enable_arm_sme_acle=false
 
 # Wheel builds need the installable macOS runtime dylib linked into python
 # extensions and packaged into the wheel.
@@ -340,6 +344,61 @@ build:cross_compile_linux_arm64 --cpu=aarch64
 build:cross_compile_linux_arm64 --host_cpu=k8
 build:cross_compile_linux_arm64 --define=tensorflow_mkldnn_contraction_kernel=0
 
+# Windows ARM64 (e.g. Snapdragon X series) cross-compilation from an x86_64
+# Windows host with MSVC (Hostx64\arm64 cl.exe). Use with --config=windows; see
+# ci/setup_windows_arm64_toolchain.ps1 for the required MSVC ARM64 build tools.
+#
+# --cpu is still needed by deps that select on it, e.g. XNNPACK's
+# build_config:windows_arm64, which disables the fp16-scalar, bf16, SVE2,
+# KleidiAI and assembly kernels. cl.exe has no ACLE support for the
+# fp16-vector and SME kernels either (see litert/CMakeLists.txt), nor for the
+# BF16 intrinsics used by the i8mm kernels.
+build:cross_compile_windows_arm64 --cpu=arm64_windows
+build:cross_compile_windows_arm64 --host_cpu=x64_windows
+build:cross_compile_windows_arm64 --platforms=//platforms:windows_arm64
+build:cross_compile_windows_arm64 --extra_toolchains=@local_config_cc//:cc-toolchain-arm64_windows
+build:cross_compile_windows_arm64 --define=xnn_enable_arm_fp16_vector=false
+build:cross_compile_windows_arm64 --define=xnn_enable_arm_i8mm=false
+build:cross_compile_windows_arm64 --define=xnn_enable_arm_sme=false
+build:cross_compile_windows_arm64 --define=xnn_enable_arm_sme2=false
+
+# Cross-compile for Windows x86_64 from a Linux x86_64 host with the hermetic
+# @llvm18_linux_x86_64 clang-cl + lld-link + llvm-lib and xwin MSVC/Windows SDK
+# sysroot. Don't trigger --config=<host platform> when cross-compiling: on a
+# Linux host it would apply build:linux (-std=gnu++17, -fpermissive, GCC-style
+# -W copts, --config=dynamic_kernels), which clang-cl must not receive.
+build:cross_compile_windows_x86_64 --noenable_platform_specific_config
+build:cross_compile_windows_x86_64 --incompatible_enable_cc_toolchain_resolution
+build:cross_compile_windows_x86_64 --platforms=//platforms:windows_x86_64
+build:cross_compile_windows_x86_64 --extra_toolchains=//third_party/windows_msvc_toolchain:linux_x86_64_windows_x86_64
+build:cross_compile_windows_x86_64 --compiler=clang-cl
+build:cross_compile_windows_x86_64 --cpu=x64_windows
+build:cross_compile_windows_x86_64 --host_cpu=k8
+build:cross_compile_windows_x86_64 --host_cxxopt=-std=c++17
+build:cross_compile_windows_x86_64 --host_copt=-w
+build:cross_compile_windows_x86_64 --copt=/W0
+build:cross_compile_windows_x86_64 --copt=/Zc:__cplusplus
+build:cross_compile_windows_x86_64 --copt=/Zc:preprocessor
+build:cross_compile_windows_x86_64 --copt=/D_USE_MATH_DEFINES
+build:cross_compile_windows_x86_64 --copt=-D_ENABLE_EXTENDED_ALIGNED_STORAGE
+build:cross_compile_windows_x86_64 --copt=/U_WIN32_WINNT
+build:cross_compile_windows_x86_64 --copt=/D_WIN32_WINNT=0x0A00
+build:cross_compile_windows_x86_64 --copt=-DWIN32_LEAN_AND_MEAN
+build:cross_compile_windows_x86_64 --copt=-DNOGDI
+build:cross_compile_windows_x86_64 --copt=/arch:AVX2
+build:cross_compile_windows_x86_64 --conlyopt=/std:c11
+build:cross_compile_windows_x86_64 --cxxopt=/std:c++20
+build:cross_compile_windows_x86_64 --per_file_copt=external/com_google_protobuf/.*\.cc$@/std:c++17
+build:cross_compile_windows_x86_64 --config=monolithic
+build:cross_compile_windows_x86_64 --linkopt=/OPT:REF
+build:cross_compile_windows_x86_64 --linkopt=/OPT:ICF
+build:cross_compile_windows_x86_64 --features=compiler_param_file
+build:cross_compile_windows_x86_64 --features=archive_param_file
+build:cross_compile_windows_x86_64 --define=build_with_mkl=false
+build:cross_compile_windows_x86_64 --define=build_with_openmp=false
+build:cross_compile_windows_x86_64 --define=xnn_enable_avx512bf16=false
+build:cross_compile_windows_x86_64 --define=xnn_enable_avx512fp16=false
+
 # Windows pthreadpool configuration
 # On Windows, set /std:c11 and /experimental:c11atomics for pthreadpool.
 build:windows --conlyopt=/std:c11
@@ -352,7 +411,6 @@ build:windows --per_file_copt=external/pthreadpool/_*@/D_CRT_SECURE_NO_WARNINGS
 
 # Force include MSVC compatibility header for litert files
 build:windows --per_file_copt=external/litert/.*@/FI"C:/BuildTools/LiteRT-LM/msvc_compat.h"
-
 
 # On Windows, `__cplusplus` is wrongly defined without this switch
 # See https://devblogs.microsoft.com/cppblog/msvc-now-correctly-reports-__cplusplus/
@@ -611,3 +669,10 @@ test:bulk_test_cpu --build_tests_only
 # TODO: b/397625618 Enable bzlmod
 common --noenable_bzlmod
 
+
+build:windows_arm64 --cpu=arm64_windows
+build:windows_arm64 --host_cpu=arm64_windows
+
+# Build the Dawn (WebGPU) runtime library from source, to be loaded by the ML Drift WebGPU accelerator.
+# See third_party/dawn/workspace.bzl.
+build:dawn_from_source --repo_env=LITERT_BUILD_DAWN=1

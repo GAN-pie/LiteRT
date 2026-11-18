@@ -156,6 +156,7 @@ litert_c_api_library(
     header_deps = [":litert_environment_options_header"],
     header_kwargs = {"compatible_with": get_compatible_with_portable()},
     impl_deps = [
+        ":litert_any",
         ":litert_environment_options",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/synchronization",
@@ -558,10 +559,22 @@ cc_test(
     ],
 )
 
+cc_library(
+    name = "litert_op_resolver",
+    hdrs = ["litert_op_resolver.h"],
+    compatible_with = get_compatible_with_portable(),
+)
+
 litert_c_api_library(
     name = "litert_options",
     srcs = ["litert_options.cc"],
     hdrs = ["litert_options.h"],
+    copts = select({
+        "//litert/build_common:litert_disable_cpu": [
+            "-DLITERT_DISABLE_CPU",
+        ],
+        "//conditions:default": [],
+    }),
     # We want `compatible_with = get_compatible_with_portable()` only
     # for the header target, not for the impl target, to avoid having
     # to propagage similar `compatible_with` declarations into all the
@@ -576,6 +589,7 @@ litert_c_api_library(
     deps = [
         ":litert_common",
         ":litert_custom_op_kernel",
+        ":litert_op_resolver",
     ],
 )
 
@@ -584,6 +598,7 @@ cc_test(
     srcs = ["litert_options_test.cc"],
     deps = [
         ":litert_common",
+        ":litert_op_resolver",
         ":litert_opaque_options",
         ":litert_options",
         "//litert/cc:litert_expected",
@@ -979,6 +994,7 @@ macos_dylib(
     exported_symbols_lists = export_lrt_runtime_only_script(),
     linkopts = [
         "-install_name @rpath/libLiteRt.dylib",
+        "-headerpad_max_install_names",
     ] + LITERT_RUNTIME_C_API_DARWIN_FORCE_LINKOPTS,
     minimum_os_version = LITERT_MIN_MACOS_VERSION,
     deps = LITERT_C_API_COMMON_DEPS,
@@ -1003,6 +1019,7 @@ ios_framework(
     infoplists = ["LiteRtInfo.plist"],
     linkopts = [
         "-install_name @rpath/libLiteRt.dylib",
+        "-headerpad_max_install_names",
     ] + LITERT_RUNTIME_C_API_DARWIN_FORCE_LINKOPTS,
     minimum_os_version = LITERT_MIN_IOS_VERSION,
     tags = ["notap"],
@@ -1227,6 +1244,7 @@ objc_library(
 ios_unit_test(
     name = "litert_tensor_buffer_test_ios",
     minimum_os_version = LITERT_MIN_IOS_VERSION,
+    # copybara:uncomment requires_booted_simulator = True,
     runner = "@build_bazel_rules_apple//apple/testing/default_runner:ios_default_runner",
     deps = [":litert_tensor_buffer_test_library"],
 )
@@ -1256,6 +1274,7 @@ filegroup(
         "litert_model_types.h",
         "litert_op_code.h",
         "litert_op_options.h",
+        "litert_op_resolver.h",
         "litert_opaque_options.h",
         "litert_opencl_types.h",
         "litert_options.h",

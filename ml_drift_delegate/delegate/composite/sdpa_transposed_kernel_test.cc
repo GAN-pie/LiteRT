@@ -35,6 +35,7 @@
 #include "ml_drift/common/gpu_model.h"  // from @ml_drift
 #include "ml_drift/common/gpu_model_builder.h"  // from @ml_drift
 #include "ml_drift/common/ir_model.h"  // from @ml_drift
+#include "ml_drift/common/kernel_info.h"  // from @ml_drift
 #include "ml_drift/common/kernels/fully_connected.h"  // from @ml_drift
 #include "ml_drift/common/kernels/tests/kernel_test.h"  // from @ml_drift
 #include "ml_drift/common/precision.h"  // from @ml_drift
@@ -42,11 +43,14 @@
 #include "ml_drift/common/task/gpu_operation.h"  // from @ml_drift
 #include "ml_drift/common/task/tensor_desc.h"  // from @ml_drift
 #include "ml_drift/common/task/testing_util.h"  // from @ml_drift
+#include "ml_drift/common/task/tuning_type.h"  // from @ml_drift
 #include "ml_drift/common/task/weights_layout.h"  // from @ml_drift
 #include "ml_drift/common/tensor.h"  // from @ml_drift
+#include "ml_drift/common/types.h"  // from @ml_drift
 #include "ml_drift_delegate/delegate/composite/add_values_to_cache_kernel.h"
 #include "ml_drift_delegate/delegate/composite/add_values_to_cache_parser.h"
 #include "ml_drift_delegate/delegate/composite/sdpa_transposed_parser.h"
+#include "ml_drift_delegate/delegate/composite/sdpa_transposed_support.h"
 
 namespace litert::ml_drift {
 namespace {
@@ -309,7 +313,8 @@ absl::Status CheckDecomposedSdpaScoreChunks(
 
 // Whether the decomposed graph on `gpu_info` splits score tensors within
 // `kMaxDecomposedSdpaScoreBytes`: not on OpenCL and WebGPU, which keep them on
-// one GEMM (`DecomposedSdpaScoreChunkBudget`).
+// one GEMM (`DecomposedSdpaScoreChunkBudget`), except for WebGPU on Apple GPUs
+// (`PrefersChunkedDecomposedPrefill`).
 bool SplitsScoresWithinPrefillBudget(const ::ml_drift::GpuInfo& gpu_info) {
   return DecomposedSdpaScoreChunkBudget(gpu_info, kMaxDecomposedSdpaScoreBytes,
                                         /*max_chunk_bytes=*/0) == 0;
@@ -340,6 +345,9 @@ bool SplitsScoresWithinPrefillBudget(const ::ml_drift::GpuInfo& gpu_info) {
 // the decomposed graph. When `expected_score_chunks` is positive, the test also
 // checks that the built graph splits the query rows into that many chunks (one
 // `strided_slice` per chunk when there is more than one).
+// With `select_as_apple_m4_pro`, Metal kernel configs are selected as on a
+// 20-core M4 Pro (e.g. GQA head groups and key splits of the wave-SIMD flash
+// decode), while the graph still runs on the test device.
 absl::Status RunSdpaTransposedTest(
     ::ml_drift::TestExecutionEnvironment& env,
     ::ml_drift::CalculationsPrecision precision,
@@ -352,7 +360,9 @@ absl::Status RunSdpaTransposedTest(
     bool force_work_group_flash_prefill = false,
     uint64_t max_decomposed_score_chunk_bytes =
         kMaxDecomposedSdpaScoreChunkBytes,
-    int expected_score_chunks = 0) {
+    int expected_score_chunks = 0,
+    std::optional<bool> is_prefill_override = std::nullopt,
+    float q_multiplier = 1.0f, bool select_as_apple_m4_pro = false) {
   if (KV <= 0) KV = BK;
   if (active_tokens <= 0) active_tokens = S;
   if (decode_mask_keys <= 0) decode_mask_keys = active_tokens;
@@ -365,7 +375,11 @@ absl::Status RunSdpaTransposedTest(
     return absl::InvalidArgumentError(
         "Only single-token outputs can be flattened.");
   }
-  ::ml_drift::GpuModelBuilder builder(env.GetGpuInfo(), {}, precision, storage);
+  ::ml_drift::GpuInfo builder_gpu_info = env.GetGpuInfo();
+  if (select_as_apple_m4_pro && IsAppleMetal(builder_gpu_info)) {
+    builder_gpu_info.apple_info = ::ml_drift::AppleInfo("apple m4 pro");
+  }
+  ::ml_drift::GpuModelBuilder builder(builder_gpu_info, {}, precision, storage);
 
   ::ml_drift::DataType datatype;
   switch (precision) {
@@ -425,7 +439,7 @@ absl::Status RunSdpaTransposedTest(
   SdpaTransposedAttributes attr;
   attr.runtime_check.src_end_ch_index = 2;
   attr.from_cache_update = from_cache_update;
-  attr.is_prefill = (T > 1);
+  attr.is_prefill = is_prefill_override.value_or(T > 1);
   attr.is_causal = is_causal;
 
   auto k_weights_shape = ::ml_drift::OHWI(
@@ -484,7 +498,8 @@ absl::Status RunSdpaTransposedTest(
   ABSL_RETURN_IF_ERROR(
       CheckDecomposedSdpaScoreChunks(gpu_model, expected_score_chunks));
 
-  const float q_scale = 1.0f / std::sqrt(static_cast<float>(H));
+  const float q_scale = q_multiplier / std::sqrt(static_cast<float>(H));
+  const float inv_q_multiplier = 1.0f / q_multiplier;
 
   std::vector<float> q_data(BK * T * H, 0.0f);
   for (int bk = 0; bk < BK; ++bk) {
@@ -502,8 +517,8 @@ absl::Status RunSdpaTransposedTest(
     for (int s = 0; s < S; ++s) {
       for (int h = 0; h < H; ++h) {
         int idx = (kvh * S + s) * H + h;
-        k_data[idx] =
-            0.05f * (kvh + 1) + 0.02f * (s + 1) - 0.01f * ((h % 8) + 1);
+        k_data[idx] = inv_q_multiplier * (0.05f * (kvh + 1) + 0.02f * (s + 1) -
+                                          0.01f * ((h % 8) + 1));
       }
     }
   }
@@ -872,6 +887,206 @@ TEST_P(SdpaTransposedKernelExecuteTest,
   EXPECT_TRUE(status.ok()) << status.message();
 }
 
+// Qwen3.5 full-attention decode: head dim 256, 8 query heads sharing 2 KV
+// heads, flattened [1, 1, 1, 2048] output.
+TEST_P(SdpaTransposedKernelExecuteTest, SingleTokenDecodeQwen35HeadDim256) {
+  for (bool from_cache_update : {true, false}) {
+    const int s = from_cache_update ? 600 : 64;
+    const int q_start = from_cache_update ? 560 : 0;
+    const int active_tokens =
+        from_cache_update ? FilledCacheEntries(mask_mode(), 561, 600) : 0;
+    auto status = RunSdpaTransposedTest(
+        *exec_env, precision(), storage(), /*BK=*/8, /*T=*/1, /*S=*/s,
+        /*H=*/256, mask_mode(), /*KV=*/2, q_start, from_cache_update,
+        /*is_causal=*/false, /*flatten_output=*/true, active_tokens);
+    EXPECT_TRUE(status.ok()) << "from_cache_update=" << from_cache_update
+                             << ": " << status.message();
+  }
+}
+
+// Non-power-of-two head dims whose channel slices do not fill the 32 lanes of
+// a wave: on Metal, the wave-SIMD decode kernel walks the slices in passes of
+// 32 lanes and leaves the lanes past the last slice idle. Head dim 80 has 20
+// slices (1 pass), 192 has 48 (2 passes) and 320 has 80 (3 passes; above 256,
+// it takes this kernel since 80 slices do not divide the work-group kernel's
+// 256 work items).
+TEST_P(SdpaTransposedKernelExecuteTest,
+       SingleTokenDecodeNonPowerOfTwoHeadDims) {
+  for (int head_dim : {80, 192, 320}) {
+    auto status = RunSdpaTransposedTest(
+        *exec_env, precision(), storage(), /*BK=*/8, /*T=*/1, /*S=*/600,
+        /*H=*/head_dim, mask_mode(), /*KV=*/2, /*q_start=*/560,
+        /*from_cache_update=*/true, /*is_causal=*/false,
+        /*flatten_output=*/true,
+        /*active_tokens=*/FilledCacheEntries(mask_mode(), 561, 600));
+    EXPECT_TRUE(status.ok())
+        << "head_dim=" << head_dim << ": " << status.message();
+  }
+}
+
+// The wave-SIMD flash decode is generated for one fixed work group size. When
+// the compiled pipeline allows fewer threads (paravirtualized Apple GPUs), it
+// must offer no dispatch: every GPU backend then fails tuning with "No dispatch
+// parameters to launch kernel" instead of launching a work group that the
+// pipeline rejects and that silently writes nothing.
+TEST(SdpaTransposedKernelTest,
+     WaveSimdFlashDecodeHasNoDispatchAbovePipelineLimit) {
+  ::ml_drift::GpuInfo gpu_info;
+  gpu_info.vendor = ::ml_drift::GpuVendor::kApple;
+  gpu_info.gpu_api = ::ml_drift::GpuApi::kMetal;
+  gpu_info.supported_wave_sizes = {32};
+  gpu_info.apple_info = ::ml_drift::AppleInfo("apple m4 pro");
+  gpu_info.metal_info.language_version =
+      ::ml_drift::MetalLanguageVersion::kMetal3_0;
+  gpu_info.metal_info.max_work_group_size_x = 1024;
+  gpu_info.metal_info.max_work_group_size_y = 1024;
+  gpu_info.metal_info.max_work_group_size_z = 1024;
+
+  // Qwen3.5 full-attention decode: 8 query heads share 2 KV heads of head dim
+  // 256, with a flattened output.
+  constexpr int kQHeads = 8;
+  constexpr int kKvHeads = 2;
+  constexpr int kHeadDim = 256;
+  constexpr int kCacheSize = 600;
+  const ::ml_drift::BHWC q_shape(1, kQHeads, 1, kHeadDim);
+  ASSERT_TRUE(
+      GetFlashDecodeConfig(gpu_info, q_shape,
+                           ::ml_drift::BHWC(1, kKvHeads, kCacheSize, kHeadDim))
+          .use_wave_simd);
+
+  const ::ml_drift::DataType dtype = ::ml_drift::DataType::kFloat16;
+  ::ml_drift::GpuModelBuilder builder(gpu_info, {},
+                                      ::ml_drift::CalculationsPrecision::kF16,
+                                      ::ml_drift::TensorStorageType::kBuffer);
+  auto q = builder.AddTensor(q_shape, dtype);
+  auto k = builder.AddTensor(1, kKvHeads, kCacheSize, kHeadDim,
+                             ::ml_drift::TensorStorageType::kBuffer, dtype);
+  auto v = builder.AddTensor(1, kKvHeads, kHeadDim, kCacheSize,
+                             ::ml_drift::TensorStorageType::kBuffer, dtype);
+  ::ml_drift::Tensor<::ml_drift::StrongShape<::ml_drift::Layout::kBHWC>,
+                     ::ml_drift::DataType::kInt32>
+      param_cpu;
+  param_cpu.shape = ::ml_drift::BHWC(1, 1, 1, 7);
+  param_cpu.data = {kCacheSize - 1, kCacheSize, kCacheSize, 0, 0, 0, 0};
+  ::ml_drift::TensorDescriptor param_desc(
+      ::ml_drift::DataType::kInt32, ::ml_drift::TensorStorageType::kBuffer,
+      ::ml_drift::Layout::kBHWC);
+  param_desc.UploadData(param_cpu);
+  auto param = builder.AddConstantTensor(std::move(param_desc));
+  auto out =
+      builder.AddTensor(::ml_drift::BHWC(1, 1, 1, kQHeads * kHeadDim), dtype);
+
+  SdpaTransposedAttributes attr;
+  attr.runtime_check.src_end_ch_index = 2;
+  attr.from_cache_update = true;
+  attr.is_prefill = false;
+  const ::ml_drift::BHWC k_shape = k.tensor_desc.GetBHWCShape();
+  attr.bmm1_weights.weights_shape =
+      ::ml_drift::OHWI(k_shape.w, k_shape.h, 1, k_shape.c);
+  attr.bmm1_weights.desc = ::ml_drift::GetFullyConnectedWeightsDesc(
+      ::ml_drift::DataType::kFloat32, attr.bmm1_weights.weights_shape);
+  attr.bmm1_weights.desc.layout =
+      ::ml_drift::WeightsLayout::kOSpatialIOGroupO4I4;
+  const ::ml_drift::BHWC v_shape = v.tensor_desc.GetBHWCShape();
+  attr.bmm2_weights.weights_shape =
+      ::ml_drift::OHWI(v_shape.w, v_shape.h, 1, v_shape.c);
+  attr.bmm2_weights.desc = ::ml_drift::GetFullyConnectedWeightsDesc(
+      ::ml_drift::DataType::kFloat32, attr.bmm2_weights.weights_shape);
+  const absl::Status build_status = BuildSdpaTransposedGpuGraph(
+      {q.id, k.id, v.id, param.id}, out.id, attr, &builder);
+  ASSERT_TRUE(build_status.ok()) << build_status.message();
+  ::ml_drift::GpuModel gpu_model;
+  const absl::Status model_status = builder.GetGpuModel(
+      {{q.id, 0}, {k.id, 1}, {v.id, 2}}, {{out.id, 0}}, &gpu_model);
+  ASSERT_TRUE(model_status.ok()) << model_status.message();
+
+  const ::ml_drift::GPUOperation* flash_decode = nullptr;
+  for (const auto& node : gpu_model.nodes) {
+    if (node.name == "flash_decode_sdpa" ||
+        node.name == "flash_decode_sdpa_split") {
+      flash_decode = node.gpu_operation.get();
+    }
+  }
+  ASSERT_NE(flash_decode, nullptr);
+  const ::ml_drift::int3 work_group = flash_decode->work_group_size_;
+  const int launch_size = work_group.x * work_group.y * work_group.z;
+
+  std::vector<::ml_drift::GPUOperation::DispatchInfo> dispatches;
+  // The pipeline allows fewer threads than the launch: no dispatch.
+  flash_decode->GetPossibleDispatches(
+      ::ml_drift::TuningType::kFast, gpu_info,
+      ::ml_drift::KernelInfo{/*private_memory_size=*/0,
+                             /*max_work_group_size=*/launch_size - 32},
+      &dispatches);
+  EXPECT_TRUE(dispatches.empty());
+  // A limit equal to the launch size, or no reported limit (0): the fixed
+  // work group.
+  for (const int max_work_group_size : {launch_size, 0}) {
+    flash_decode->GetPossibleDispatches(
+        ::ml_drift::TuningType::kFast, gpu_info,
+        ::ml_drift::KernelInfo{/*private_memory_size=*/0, max_work_group_size},
+        &dispatches);
+    ASSERT_EQ(dispatches.size(), 1u) << max_work_group_size;
+    EXPECT_EQ(dispatches[0].work_group_size.x, work_group.x);
+    EXPECT_EQ(dispatches[0].work_group_size.y, work_group.y);
+    EXPECT_EQ(dispatches[0].work_group_size.z, work_group.z);
+  }
+}
+
+// GQA head groups and key splits of the wave-SIMD flash decode. Kernel configs
+// are selected as on a 20-core M4 Pro: test devices with fewer compute units
+// (e.g. the paravirtualized Apple GPUs on Forge report 4) keep one head per
+// work group and one split. Each case also checks the selected config, so a
+// routing change cannot silently drop the coverage:
+// - head dims 256 (Qwen3.5-0.8B), 128 and 80 (20 slices, so idle lanes) group
+//   2, 4 and 4 query heads per work group and split the keys;
+// - head dim 192 (48 slices) groups 2 heads with a partial last slice pass;
+// - GQA group 3 cannot form 2-head groups and keeps one head per work group.
+TEST_P(SdpaTransposedKernelExecuteTest,
+       SingleTokenDecodeGqaHeadGroupsAndSplitKeys) {
+  if (!IsAppleMetal(exec_env->GetGpuInfo())) {
+    GTEST_SKIP() << "GQA head groups and key splits are configs of the "
+                    "wave-SIMD (Metal) flash decode.";
+  }
+  ::ml_drift::GpuInfo m4_pro = exec_env->GetGpuInfo();
+  m4_pro.apple_info = ::ml_drift::AppleInfo("apple m4 pro");
+  struct Case {
+    int q_heads;
+    int kv_heads;
+    int head_dim;
+    int cache_size;
+    int expected_heads;
+    int expected_splits;
+  };
+  const Case cases[] = {
+      {8, 2, 256, 1280, 2, 5}, {8, 2, 128, 1280, 4, 5}, {8, 2, 80, 600, 4, 2},
+      {4, 2, 192, 1024, 2, 4}, {6, 2, 192, 400, 1, 1},
+  };
+  for (const Case& c : cases) {
+    const FlashDecodeConfig config = GetFlashDecodeConfig(
+        m4_pro, ::ml_drift::BHWC(1, c.q_heads, 1, c.head_dim),
+        ::ml_drift::BHWC(1, c.kv_heads, c.cache_size, c.head_dim));
+    ASSERT_TRUE(config.use_wave_simd) << "head_dim=" << c.head_dim;
+    EXPECT_EQ(config.heads, c.expected_heads) << "head_dim=" << c.head_dim;
+    EXPECT_EQ(config.splits, c.expected_splits) << "head_dim=" << c.head_dim;
+    const int q_start = c.cache_size - 40;
+    const int active_tokens =
+        FilledCacheEntries(mask_mode(), q_start + 1, c.cache_size);
+    auto status = RunSdpaTransposedTest(
+        *exec_env, precision(), storage(), c.q_heads, /*T=*/1, c.cache_size,
+        c.head_dim, mask_mode(), c.kv_heads, q_start,
+        /*from_cache_update=*/true, /*is_causal=*/false,
+        /*flatten_output=*/true, active_tokens, /*decode_mask_keys=*/0,
+        /*param_active_tokens=*/std::nullopt,
+        /*force_work_group_flash_prefill=*/false,
+        kMaxDecomposedSdpaScoreChunkBytes, /*expected_score_chunks=*/0,
+        /*is_prefill_override=*/std::nullopt, /*q_multiplier=*/1.0f,
+        /*select_as_apple_m4_pro=*/true);
+    EXPECT_TRUE(status.ok())
+        << "head_dim=" << c.head_dim << ": " << status.message();
+  }
+}
+
 // Gemma 4 global-attention decode: head dim 512 (128 channel slices) with 4
 // query heads per KV head and a flattened output.
 TEST_P(SdpaTransposedKernelExecuteTest,
@@ -916,6 +1131,64 @@ TEST_P(SdpaTransposedKernelExecuteTest,
     EXPECT_TRUE(status.ok())
         << "head_dim=" << head_dim << ": " << status.message();
   }
+}
+
+// Gemma 4 26B global-attention decode at an 8K cache (32 MiB of K and V), where
+// the Apple Metal SIMD-group work-group kernel processes all 8 GQA query heads
+// in one work group with one SIMD lane per key (`kSimdWorkGroupFullGqaKvBytes`)
+// and 5,201 active entries split into one full 256-key chunk plus an 8-key
+// cooperative tail chunk per split.
+TEST_P(SdpaTransposedKernelExecuteTest,
+       SingleTokenDecodeGemma4GlobalFullGqaEightHeads) {
+  auto status = RunSdpaTransposedTest(
+      *exec_env, precision(), storage(), /*BK=*/16, /*T=*/1, /*S=*/8192,
+      /*H=*/512, mask_mode(), /*KV=*/2, /*q_start=*/5200,
+      /*from_cache_update=*/true, /*is_causal=*/false, /*flatten_output=*/true,
+      /*active_tokens=*/FilledCacheEntries(mask_mode(), 5201, 8192));
+  EXPECT_TRUE(status.ok()) << status.message();
+}
+
+// Speculative-decoding MTP verifier (`T = 2`, `attr.is_prefill = false` as set
+// by `sdpa_transposed_parser.cc` for `q_shape.w <= 2`) on Gemma 4 26B global
+// (head dim 512, 8 query heads per KV head) and sliding (head dim 256, 2 query
+// heads per KV head) attention across multiple key splits.
+TEST_P(SdpaTransposedKernelExecuteTest, TwoTokenVerifierDecodeGemma4HeadDims) {
+  for (const auto& [head_dim, kv_heads] :
+       {std::pair{512, 2}, std::pair{256, 8}}) {
+    auto status = RunSdpaTransposedTest(
+        *exec_env, precision(), storage(), /*BK=*/16, /*T=*/2, /*S=*/1024,
+        /*H=*/head_dim, mask_mode(), /*KV=*/kv_heads, /*q_start=*/600,
+        /*from_cache_update=*/true, /*is_causal=*/false,
+        /*flatten_output=*/false,
+        /*active_tokens=*/FilledCacheEntries(mask_mode(), 602, 1024),
+        /*decode_mask_keys=*/0, /*param_active_tokens=*/std::nullopt,
+        /*force_work_group_flash_prefill=*/false,
+        /*max_decomposed_score_chunk_bytes=*/kMaxDecomposedSdpaScoreChunkBytes,
+        /*expected_score_chunks=*/0, /*is_prefill_override=*/false);
+    EXPECT_TRUE(status.ok())
+        << "head_dim=" << head_dim << ": " << status.message();
+  }
+}
+
+// F32 query channels exceeding the F16 maximum (65,504): downcasting `q_local`
+// to `half4` overflows to +/-Inf and produces NaNs, whereas keeping `q_local`
+// in `float4` preserves the F32 dynamic range.
+TEST_P(SdpaTransposedKernelExecuteTest,
+       SingleTokenDecodeFloat32QueryExceedingFp16Max) {
+  if (precision() != ::ml_drift::CalculationsPrecision::kF32) {
+    GTEST_SKIP() << "Requires F32 input tensors.";
+  }
+  auto status = RunSdpaTransposedTest(
+      *exec_env, precision(), storage(), /*BK=*/16, /*T=*/1, /*S=*/600,
+      /*H=*/512, mask_mode(), /*KV=*/2, /*q_start=*/560,
+      /*from_cache_update=*/true, /*is_causal=*/false, /*flatten_output=*/true,
+      /*active_tokens=*/FilledCacheEntries(mask_mode(), 561, 600),
+      /*decode_mask_keys=*/0, /*param_active_tokens=*/std::nullopt,
+      /*force_work_group_flash_prefill=*/false,
+      /*max_decomposed_score_chunk_bytes=*/kMaxDecomposedSdpaScoreChunkBytes,
+      /*expected_score_chunks=*/0, /*is_prefill_override=*/std::nullopt,
+      /*q_multiplier=*/2.0e7f);
+  EXPECT_TRUE(status.ok()) << status.message();
 }
 
 // Gemma 4 chunked prefill at head dims 256 (sliding window) and 512 (global
@@ -1108,15 +1381,16 @@ TEST_P(SdpaTransposedKernelExecuteTest,
 // mask (`MaskMode::kNone`, `attr.is_causal = true`) on a sliding-window ring
 // buffer that has wrapped around (`q_start = step % S < S - 1`, while
 // `active_tokens = S`), the fused Flash-Decode kernel attends to all `S` active
-// keys rather than clamping `active_tokens` to `q_start + 1`. Head dim 128
-// takes the wave-SIMD variant on Metal and head dim 256 the work-group variant.
+// keys rather than clamping `active_tokens` to `q_start + 1`. Head dims 128
+// and 256 take the wave-SIMD variant on Metal and head dim 512 the work-group
+// variant.
 TEST_P(SdpaTransposedKernelExecuteTest,
        SingleTokenDecodeRingBufferWrapAroundImplicitCausal) {
   if (!SupportsFusedSdpaKernels(exec_env->GetGpuInfo())) {
     GTEST_SKIP() << "BOOL causal mask pruning only applies to the fused "
                     "SDPA kernels.";
   }
-  for (int head_dim : {128, 256}) {
+  for (int head_dim : {128, 256, 512}) {
     auto status = RunSdpaTransposedTest(
         *exec_env, precision(), storage(), /*BK=*/8, /*T=*/1, /*S=*/64,
         /*H=*/head_dim, MaskMode::kNone, /*KV=*/2, /*q_start=*/4,
@@ -1163,7 +1437,7 @@ TEST_P(SdpaTransposedKernelExecuteTest,
       {/*q_start=*/kS, /*param_active_tokens=*/kS + 1,
        /*expected_active_tokens=*/kS},
   };
-  for (int head_dim : {128, 256}) {
+  for (int head_dim : {128, 256, 512}) {
     for (const Case& c : cases) {
       auto status = RunSdpaTransposedTest(
           *exec_env, precision(), storage(), /*BK=*/8, /*T=*/1, /*S=*/kS,
@@ -1258,6 +1532,7 @@ absl::Status RunSdpaTransposedInt8KvTest(
   cache_attr.kv_cache_batch_size = KV;
   cache_attr.cache_size = S;
   cache_attr.head_size = H;
+  cache_attr.kv_cache_dtype = ::ml_drift::DataType::kInt8;
   cache_attr.scale_k = kScaleK;
   cache_attr.scale_v = kScaleV;
   ::ml_drift::ir::IrOp cache_ir_op(::ml_drift::ir::IrOpId{0});
@@ -1722,6 +1997,83 @@ TEST(UsesFusedSdpaKernelTest, OpenClAndWebGpuGatePrefillOnScoreBytes) {
                                     /*is_prefill=*/true,
                                     /*from_cache_update=*/true));
   }
+}
+
+// WebGPU on Apple GPUs runs long-context prefill on score chunks of the
+// decomposed graph, as Metal does where the MMA kernel does not apply.
+TEST(PrefersChunkedDecomposedPrefillTest, OnlyWebGpuOnAppleGpus) {
+  EXPECT_TRUE(PrefersChunkedDecomposedPrefill(
+      MakeGpuInfo(::ml_drift::GpuVendor::kApple, ::ml_drift::GpuApi::kWebGpu)));
+  EXPECT_FALSE(PrefersChunkedDecomposedPrefill(
+      MakeGpuInfo(::ml_drift::GpuVendor::kApple, ::ml_drift::GpuApi::kMetal)));
+  EXPECT_FALSE(PrefersChunkedDecomposedPrefill(
+      MakeGpuInfo(::ml_drift::GpuVendor::kApple, ::ml_drift::GpuApi::kOpenCl)));
+  EXPECT_FALSE(PrefersChunkedDecomposedPrefill(MakeGpuInfo(
+      ::ml_drift::GpuVendor::kQualcomm, ::ml_drift::GpuApi::kWebGpu)));
+  EXPECT_FALSE(PrefersChunkedDecomposedPrefill(MakeGpuInfo(
+      ::ml_drift::GpuVendor::kNvidia, ::ml_drift::GpuApi::kWebGpu)));
+}
+
+TEST(UsesFusedSdpaKernelTest, AppleWebGpuPrefillRunsOnScoreChunks) {
+  const auto apple_webgpu =
+      MakeGpuInfo(::ml_drift::GpuVendor::kApple, ::ml_drift::GpuApi::kWebGpu);
+  const auto other_webgpu = MakeGpuInfo(::ml_drift::GpuVendor::kQualcomm,
+                                        ::ml_drift::GpuApi::kWebGpu);
+  EXPECT_EQ(DecomposedSdpaScoreChunkBudget(apple_webgpu),
+            kMaxDecomposedSdpaScoreChunkBytes);
+  EXPECT_EQ(DecomposedSdpaScoreChunkBudget(other_webgpu),
+            kMaxDecomposedSdpaScoreBytes);
+
+  // Gemma 4 26B-A4B global attention, 1024-token prefill: 16 query heads share
+  // 2 K/V heads of head dim 512. 512 MiB, 1 GiB and 2 GiB of scores run on 4, 8
+  // and 8 chunks of 128, 128 and 256 MiB.
+  const ::ml_drift::BHWC q_shape(1, 16, 1024, 512);
+  for (const auto& [cache_size, chunks] :
+       {std::pair{16384, 4}, std::pair{32768, 8}, std::pair{65536, 8}}) {
+    const ::ml_drift::BHWC k_shape(1, 2, cache_size, 512);
+    EXPECT_FALSE(UsesWorkGroupFlashPrefill(apple_webgpu, q_shape, k_shape))
+        << "cache_size=" << cache_size;
+    EXPECT_FALSE(UsesFusedSdpaKernel(apple_webgpu, q_shape, k_shape,
+                                     /*is_prefill=*/true,
+                                     /*from_cache_update=*/true))
+        << "cache_size=" << cache_size;
+    EXPECT_EQ(
+        NumDecomposedSdpaScoreChunks(
+            q_shape, k_shape, DecomposedSdpaScoreChunkBudget(apple_webgpu)),
+        chunks)
+        << "cache_size=" << cache_size;
+  }
+  // Other WebGPU devices keep the 512 MiB on one GEMM and switch to the
+  // work-group Flash kernel above 768 MiB.
+  EXPECT_FALSE(UsesWorkGroupFlashPrefill(other_webgpu, q_shape,
+                                         ::ml_drift::BHWC(1, 2, 16384, 512)));
+  EXPECT_TRUE(UsesWorkGroupFlashPrefill(other_webgpu, q_shape,
+                                        ::ml_drift::BHWC(1, 2, 32768, 512)));
+
+  // Plain multi-head attention has no GQA group to split: 32 heads with a 32K
+  // cache keep 2 GiB of scores, so they stay on the work-group Flash kernel.
+  EXPECT_TRUE(UsesWorkGroupFlashPrefill(apple_webgpu,
+                                        ::ml_drift::BHWC(1, 32, 1024, 64),
+                                        ::ml_drift::BHWC(1, 32, 32768, 64)));
+  // A GQA group of 2 with a 64K cache: 2 chunks of 1 GiB.
+  EXPECT_TRUE(UsesWorkGroupFlashPrefill(apple_webgpu,
+                                        ::ml_drift::BHWC(1, 16, 1024, 128),
+                                        ::ml_drift::BHWC(1, 8, 65536, 128)));
+  // Qwen3 0.6B with a 32K cache: 2 chunks of 512 MiB stay on the GEMM.
+  EXPECT_FALSE(UsesWorkGroupFlashPrefill(apple_webgpu,
+                                         ::ml_drift::BHWC(1, 16, 1024, 128),
+                                         ::ml_drift::BHWC(1, 8, 32768, 128)));
+
+  // Tests still force the work-group kernel by lowering the score budget, and
+  // single-token queries never take the prefill path.
+  const ::ml_drift::BHWC small_q(1, 4, 7, 128);
+  const ::ml_drift::BHWC small_k(1, 2, 64, 128);
+  EXPECT_FALSE(UsesWorkGroupFlashPrefill(apple_webgpu, small_q, small_k));
+  EXPECT_TRUE(UsesWorkGroupFlashPrefill(apple_webgpu, small_q, small_k,
+                                        /*max_score_bytes=*/0));
+  EXPECT_FALSE(UsesWorkGroupFlashPrefill(apple_webgpu,
+                                         ::ml_drift::BHWC(1, 4, 1, 128),
+                                         small_k, /*max_score_bytes=*/0));
 }
 
 TEST(UsesFusedSdpaKernelTest, OpenClPrefillBudgetHonorsMaxAllocation) {

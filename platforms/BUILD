@@ -75,3 +75,24 @@ platform(
         "@platforms//os:linux",
     ],
 )
+
+# Target platform for Windows ARM64 (e.g. Snapdragon X series). Selects the
+# MSVC ARM64 toolchain (@local_config_cc//:cc-toolchain-arm64_windows). Used by
+# --config=cross_compile_windows_arm64.
+platform(
+    name = "windows_arm64",
+    constraint_values = [
+        "@platforms//cpu:arm64",
+        "@platforms//os:windows",
+    ],
+)
+
+# Target platform for Windows x86_64 when cross-compiling from a Linux x86_64
+# host with --config=cross_compile_windows_x86_64.
+platform(
+    name = "windows_x86_64",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:windows",
+    ],
+)

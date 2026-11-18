@@ -37,11 +37,18 @@ package(
 _OPENVINO_DEPS = ["@intel_openvino//:openvino"]
 # copybara:comment_end
 
+# MSVC-style compilers (cl.exe, clang-cl) enable C++ exceptions with /EHsc;
+# -fexceptions is not an MSVC flag.
+_EXCEPTIONS_COPTS = select({
+    "//litert/runtime/dispatch:windows_msvc": ["/EHsc"],
+    "//conditions:default": ["-fexceptions"],
+})
+
 litert_lib(
     name = "openvino_soc_config",
     srcs = ["openvino_soc_config.cc"],
     hdrs = ["openvino_soc_config.h"],
-    copts = ["-fexceptions"],
+    copts = _EXCEPTIONS_COPTS,
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     deps = [
         "//litert/c:litert_common",
@@ -55,11 +62,12 @@ litert_lib(
     name = "npu_optimizer",
     srcs = ["npu_optimizer.cc"],
     hdrs = ["npu_optimizer.h"],
-    copts = ["-fexceptions"],
+    copts = _EXCEPTIONS_COPTS,
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     deps = [
         ":weight_bank_attributes",
         "//litert/c/internal:litert_logging",
+        "//litert/vendors/intel_openvino:hfa_history",
     ] + _OPENVINO_DEPS,
 )
 
@@ -75,6 +83,7 @@ litert_test(
     ],
     deps = [
         ":npu_optimizer",
+        "//litert/vendors/intel_openvino:hfa_history",
     ] + _OPENVINO_DEPS,
 )
 
@@ -82,7 +91,7 @@ litert_lib(
     name = "weight_bank",
     srcs = ["weight_bank.cc"],
     hdrs = ["weight_bank.h"],
-    copts = ["-fexceptions"],
+    copts = _EXCEPTIONS_COPTS,
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     deps = [
         "//litert/c/internal:litert_logging",
@@ -122,7 +131,7 @@ litert_lib(
     name = "global_graph",
     srcs = ["global_graph.cc"],
     hdrs = ["global_graph.h"],
-    copts = ["-fexceptions"],
+    copts = _EXCEPTIONS_COPTS,
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     visibility = ["//litert/vendors/intel_openvino:__subpackages__"],
     deps = [
@@ -151,7 +160,7 @@ litert_lib(
     name = "weights_to_parameters",
     srcs = ["weights_to_parameters.cc"],
     hdrs = ["weights_to_parameters.h"],
-    copts = ["-fexceptions"],
+    copts = _EXCEPTIONS_COPTS,
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     deps = [
         ":weight_bank",
@@ -190,7 +199,7 @@ litert_test(
 litert_lib(
     name = "weight_bank_attributes",
     hdrs = ["weight_bank_attributes.h"],
-    copts = ["-fexceptions"],
+    copts = _EXCEPTIONS_COPTS,
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     deps = _OPENVINO_DEPS,
 )
@@ -205,13 +214,15 @@ litert_lib(
         "weightless_caching_attributes.hpp",
     ],
     hdrs = ["alias_shared_constants.h"],
-    copts = ["-fexceptions"],
+    copts = _EXCEPTIONS_COPTS,
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     deps = [
         ":weight_bank",
         ":weight_bank_attributes",
         "//litert/c/internal:litert_logging",
+        "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/types:span",
+        "@farmhash_archive//:farmhash",
     ] + _OPENVINO_DEPS,
 )
 
@@ -252,13 +263,34 @@ litert_lib(
     name = "openvino_compile_context",
     srcs = ["openvino_compile_context.cc"],
     hdrs = ["openvino_compile_context.h"],
-    copts = ["-fexceptions"],
+    copts = _EXCEPTIONS_COPTS,
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     deps = [
         ":npu_optimizer",
         ":openvino_soc_config",
         "//litert/c:litert_common",
         "//litert/c/internal:litert_logging",
+        "//litert/c/options:litert_intel_openvino_options",
+        "//litert/cc:litert_expected",
+        "//litert/cc/options:litert_intel_openvino_options",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ] + _OPENVINO_DEPS,
+)
+
+litert_test(
+    name = "openvino_compile_context_test",
+    srcs = ["openvino_compile_context_test.cc"],
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],  # Incompatible with -fexceptions.
+    tags = [
+        "manual",
+        "nobuilder",
+        "notap",
+    ],
+    deps = [
+        ":openvino_compile_context",
+        "//litert/c:litert_common",
         "//litert/c/options:litert_intel_openvino_options",
         "//litert/cc:litert_expected",
         "//litert/cc/options:litert_intel_openvino_options",
@@ -327,11 +359,11 @@ litert_dynamic_lib(
 )
 
 litert_bin(
-    name = "LiteRtCompilerPlugin",
+    name = "LiteRtCompilerPlugin_IntelOpenvino",
     srcs = [
         "openvino_compiler_plugin.cc",
     ],
-    copts = ["-fexceptions"] + select({
+    copts = _EXCEPTIONS_COPTS + select({
         "//litert/runtime/dispatch:windows_msvc": [
             "/DLITERT_COMPILE_LIBRARY",
             "/wd4018",  # -Wno-sign-compare
@@ -344,6 +376,11 @@ litert_bin(
     }),
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     linkshared = 1,
+    tags = [
+        "nobuilder",
+        "notap",
+        "windows",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         ":alias_shared_constants",
@@ -380,12 +417,18 @@ litert_bin(
     ] + _OPENVINO_DEPS,
 )
 
+alias(
+    name = "LiteRtCompilerPlugin",
+    actual = ":LiteRtCompilerPlugin_IntelOpenvino",
+    visibility = ["//visibility:public"],
+)
+
 litert_lib(
     name = "litert_compiler_plugin_c_api",
     hdrs = [
         "//litert/vendors/c:litert_compiler_plugin.h",
     ],
-    copts = ["-fexceptions"],
+    copts = _EXCEPTIONS_COPTS,
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     deps = [
         "//litert/c:litert_builder_header",
@@ -399,7 +442,7 @@ litert_lib(
     hdrs = [
         "graph_iterator.h",
     ],
-    copts = ["-fexceptions"] + select({
+    copts = _EXCEPTIONS_COPTS + select({
         "//litert:windows": [],
         "//conditions:default": ["-Wno-unused-variable"],
     }),
@@ -423,7 +466,7 @@ litert_lib(
     name = "decoder",
     srcs = ["decoder.cc"],
     hdrs = ["decoder.h"],
-    copts = ["-fexceptions"],
+    copts = _EXCEPTIONS_COPTS,
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     deps = [
         "//litert/c:litert_common",
@@ -460,12 +503,17 @@ litert_test(
     ],
     deps = [
         ":decoder",
+        ":graph_iterator",
+        "//litert/c:litert_common",
+        "//litert/c:litert_model",
+        "//litert/c:litert_op_code",
         "//litert/c:litert_runtime_c_api_shared_lib",
         "//litert/c/internal:litert_compiler_context",
         "//litert/c/internal:litert_logging",
         "//litert/cc/internal:litert_extended_model",
         "//litert/compiler/cc:litert_model",
         "//litert/test:common",
+        "//litert/test:load_test_model",
         "//litert/test:matchers_oss",
         "//litert/test:test_models",
         "//litert/vendors/cc:litert_compiler_plugin",

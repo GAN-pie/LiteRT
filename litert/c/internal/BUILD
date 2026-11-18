@@ -44,6 +44,7 @@ package(
         # "//ml_drift_delegate/delegate:__subpackages__",
         # "//third_party/odml/infra/ml_drift_delegate:__subpackages__",
         # "//third_party/odml/litert/weight_loader:__subpackages__",
+        # "//third_party/odml/litert_lm/runtime/executor:__pkg__",
         # copybara:uncomment_end_and_comment_begin
         "//visibility:public",
         # copybara:comment_end
@@ -341,6 +342,7 @@ cc_library(
         # "//litert/runtime:__subpackages__",
         # "//litert/kotlin:__subpackages__",
         # "//third_party/odml/litert/weight_loader:__subpackages__",
+        # "//third_party/odml/litert_lm/runtime/executor:__pkg__",
         # copybara:uncomment_end_and_comment_begin
         "//visibility:public",
         # copybara:comment_end
@@ -408,6 +410,7 @@ cc_library(
         "//litert/c:litert_model_types.h",
         "//litert/c:litert_op_code.h",
         "//litert/c:litert_op_options.h",
+        "//litert/c:litert_op_resolver.h",
         "//litert/c:litert_opaque_options.h",
         "//litert/c:litert_opencl_types.h",
         "//litert/c:litert_options.h",
@@ -601,6 +604,7 @@ cc_library(
         "//litert/c:litert_layout",
         "//litert/c:litert_metrics_header",
         "//litert/c:litert_model_types",
+        "//litert/c:litert_op_resolver",
         "//litert/c:litert_opaque_options_header",
         "//litert/c:litert_opencl_types",
         "//litert/c:litert_tensor_buffer_types",

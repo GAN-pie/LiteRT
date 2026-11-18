@@ -39,6 +39,7 @@ package(
 exports_files([
     "run_model.cc",
     "gpu_numerics_check.cc",
+    "vision_eval_main.cc",
 ])
 
 # copybara:uncomment_begin(google-only)
@@ -156,12 +157,13 @@ cc_test(
         "//litert/cc:litert_buffer_ref",
         "//litert/cc:litert_model",
         "//litert/cc:litert_options",
-        "//litert/cc/options:litert_compiler_options",
         "//litert/core:build_stamp",
         "//litert/core:dispatch_op_schema",
         "//litert/core/model",
+        "//litert/core/util:flatbuffer_tools",
         "//litert/test:common",
         "//litert/test:matchers",
+        "//tflite/schema:schema_fbs",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/strings:string_view",
     ] + gtest_main_no_heapcheck_deps(),
@@ -223,30 +225,26 @@ litert_bin(
         "//litert/c:litert_common",
         "//litert/cc:litert_expected",
         "//litert/cc:litert_options",
+        "//litert/cc/options:litert_google_tensor_options",
         "//litert/cc/options:litert_intel_openvino_options",
+        "//litert/cc/options:litert_mediatek_options",
+        "//litert/cc/options:litert_qualcomm_options",
+        "//litert/cc/options:litert_samsung_options",
         "//litert/core:build_stamp",
         "//litert/tools/flags:apply_plugin_flags",
         "//litert/tools/flags:common_flags",
         "//litert/tools/flags:flag_types",
+        "//litert/tools/flags/vendors:google_tensor_flags",
         "//litert/tools/flags/vendors:intel_openvino_flags",
+        "//litert/tools/flags/vendors:mediatek_flags",
+        "//litert/tools/flags/vendors:qualcomm_flags",
+        "//litert/tools/flags/vendors:samsung_flags",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",
         "@com_google_absl//absl/functional:function_ref",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
-    ] + select({
-        "//litert:windows": [],
-        "//conditions:default": [
-            "//litert/cc/options:litert_google_tensor_options",
-            "//litert/cc/options:litert_mediatek_options",
-            "//litert/cc/options:litert_qualcomm_options",
-            "//litert/cc/options:litert_samsung_options",
-            "//litert/tools/flags/vendors:google_tensor_flags",
-            "//litert/tools/flags/vendors:mediatek_flags",
-            "//litert/tools/flags/vendors:qualcomm_flags",
-            "//litert/tools/flags/vendors:samsung_flags",
-        ],
-    }),
+    ],
 )
 
 litert_bin(
@@ -286,30 +284,26 @@ litert_bin(
         "//litert/c:litert_common",
         "//litert/cc:litert_expected",
         "//litert/cc:litert_options",
+        "//litert/cc/options:litert_google_tensor_options",
         "//litert/cc/options:litert_intel_openvino_options",
+        "//litert/cc/options:litert_mediatek_options",
+        "//litert/cc/options:litert_qualcomm_options",
+        "//litert/cc/options:litert_samsung_options",
         "//litert/core:build_stamp",
         "//litert/tools/flags:apply_plugin_flags",
         "//litert/tools/flags:common_flags",
         "//litert/tools/flags:flag_types",
+        "//litert/tools/flags/vendors:google_tensor_flags",
         "//litert/tools/flags/vendors:intel_openvino_flags",
+        "//litert/tools/flags/vendors:mediatek_flags",
+        "//litert/tools/flags/vendors:qualcomm_flags",
+        "//litert/tools/flags/vendors:samsung_flags",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",
         "@com_google_absl//absl/functional:function_ref",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
-    ] + select({
-        "//litert:windows": [],
-        "//conditions:default": [
-            "//litert/cc/options:litert_google_tensor_options",
-            "//litert/cc/options:litert_mediatek_options",
-            "//litert/cc/options:litert_qualcomm_options",
-            "//litert/cc/options:litert_samsung_options",
-            "//litert/tools/flags/vendors:google_tensor_flags",
-            "//litert/tools/flags/vendors:mediatek_flags",
-            "//litert/tools/flags/vendors:qualcomm_flags",
-            "//litert/tools/flags/vendors:samsung_flags",
-        ],
-    }),
+    ],
 )
 
 litert_bin(
@@ -601,6 +595,7 @@ cc_library(
         "//litert/core/util:perfetto_profiling",
         "//litert/runtime:compiled_model",
         "//litert/tools/flags:options_parser_registry",
+        "//litert/tools/flags/vendors:arm_vulkan_ml_flags",
         "//litert/tools/flags/vendors:google_tensor_flags",
         "//litert/tools/flags/vendors:intel_openvino_flags",
         "//litert/tools/flags/vendors:mediatek_flags",
@@ -642,6 +637,7 @@ cc_test(
         "//litert/cc/options:litert_gpu_options",
         "//litert/cc/options:litert_mediatek_options",
         "//litert/cc/options:litert_qualcomm_options",
+        "//litert/tools/flags/vendors:arm_vulkan_ml_flags",
         "//litert/tools/flags/vendors:google_tensor_flags",
         "//litert/tools/flags/vendors:intel_openvino_flags",
         "//litert/tools/flags/vendors:mediatek_flags",
@@ -827,6 +823,7 @@ cc_binary(
         ":tensor_utils",
         "//litert/cc:litert_common",
         "//litert/tools/flags:options_parser_registry",
+        "//litert/tools/flags/vendors:arm_vulkan_ml_flags",
         "//litert/tools/flags/vendors:google_tensor_flags",
         "//litert/tools/flags/vendors:intel_openvino_flags",
         "//litert/tools/flags/vendors:mediatek_flags",
@@ -980,6 +977,7 @@ cc_library(
     srcs = ["benchmark_litert_model_main.cc"],
     deps = [
         ":benchmark_litert_model",
+        "//litert/tools/flags/vendors:arm_vulkan_ml_flags",
         "//litert/tools/flags/vendors:google_tensor_flags",
         "//litert/tools/flags/vendors:intel_openvino_flags",
         "//litert/tools/flags/vendors:mediatek_flags",
@@ -1186,4 +1184,26 @@ cc_binary(
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",
     ],
+)
+
+litert_bin(
+    name = "litert_vision_eval",
+    srcs = ["vision_eval_main.cc"],
+    copts = ["-fno-exceptions"],
+    export_litert_only = True,
+    ungrte = True,
+    deps = ["//litert/tools/vision_eval:runner"] + litert_gpu_accelerator_deps(),
+)
+
+# Build with --define=litert_runtime_link_mode=dynamic.
+litert_bin(
+    name = "litert_vision_eval_dynamic_runtime",
+    srcs = ["vision_eval_main.cc"],
+    copts = ["-fno-exceptions"],
+    data = ["//litert/c:libLiteRt.so"] + litert_gpu_accelerator_prebuilts(),
+    # Allow LD_LIBRARY_PATH to select a pinned runtime.
+    enable_new_dtags = True,
+    linkopts = ["-lm"],
+    ungrte = True,
+    deps = ["//litert/tools/vision_eval:runner"],
 )

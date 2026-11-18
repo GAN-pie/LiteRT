@@ -16,11 +16,14 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 
@@ -37,6 +40,17 @@ namespace {
 // . w.
 // TileRows output channels per CTA: eight for wide projections, fewer for
 // narrow ones so that enough CTAs are in flight to cover memory latency.
+// Launched, when LITERT_NVIDIA_GEMV_DEPENDENT_LAUNCH asks for it, as a
+// programmatic dependent of the kernel before it (LaunchDense): a CTA lets
+// the next kernel launch as soon as it has started (trigger 0) or once its
+// output is written (1), so the next kernel's blocks fill the multiprocessors
+// this one's last wave leaves idle, and it asks for its first weights before
+// it waits for the activations. The early trigger is for a stream run
+// eagerly: in a captured CUDA graph the kernel after this one starts at the
+// trigger and its own wait does not hold it until this one completes (the
+// RTX Spark, CUDA 13.4), so a capture gets the late one. Off by default: in
+// TensorRT-RTX's captured steps the launch measured no faster with the early
+// trigger and 1.5% slower with the late one (Qwen 3.5 27B, 2026-11-04).
 template <int Rows, int Threads, int Gate, int TileRows>
 __global__ void __launch_bounds__(Threads)
     DenseKernel(const __nv_bfloat16* __restrict__ activation,
@@ -44,12 +58,15 @@ __global__ void __launch_bounds__(Threads)
                 const __half* __restrict__ scales,
                 const float* __restrict__ norm_scale, float norm_eps,
                 float norm_multiplier, __nv_bfloat16* __restrict__ output,
-                int input_size, int output_size) {
+                int input_size, int output_size, int trigger) {
   constexpr int kWarps = Threads / kWarpSize;
   __shared__ float warp_sums[Rows * TileRows * kWarps];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  if (trigger == 0) cudaTriggerProgrammaticLaunchCompletion();
+#endif
   const int n0 = blockIdx.x * TileRows;
   if (n0 >= output_size) {
-    return;
+    return;  // an exited block counts as triggered
   }
   const int blocks = input_size / kBlock;
   const size_t row_bytes = static_cast<size_t>(input_size) / 2;
@@ -62,8 +79,9 @@ __global__ void __launch_bounds__(Threads)
   const WeightTile tile{weights + n0 * row_bytes, row_bytes,
                         scales + static_cast<size_t>(n0) * blocks,
                         static_cast<size_t>(blocks), valid};
-  AccumulateTile<__nv_bfloat16, Rows, Threads, TileRows>(
-      tile, act, input_size, acc, norm_scale, squares);
+  AccumulateTile<__nv_bfloat16, Rows, Threads, TileRows, /*kCompact=*/false,
+                 /*kDependentLaunch=*/true>(tile, act, input_size, acc,
+                                            norm_scale, squares);
   ReduceTile<Rows, Threads, TileRows>(acc, warp_sums);
   float up[Rows][TileRows] = {};
   if constexpr (Gate != 0) {
@@ -108,6 +126,14 @@ __global__ void __launch_bounds__(Threads)
       }
     }
   }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  if (trigger != 0) {
+    // The block's output is in before the next kernel may launch.
+    if (threadIdx.x == 0) __threadfence();
+    __syncthreads();
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
 }
 
 struct DenseNorm {
@@ -119,6 +145,40 @@ struct DenseNorm {
 // Enough CTAs to keep the device's memory system busy.
 constexpr int kDenseMinCtas = 1024;
 
+// LITERT_NVIDIA_GEMV_DEPENDENT_LAUNCH: unset or 0, the dense kernels are
+// launched in plain stream order (the default: in TensorRT-RTX's captured
+// steps the dependent launch measured no faster with the early trigger and
+// 1.5% slower with the late one, Qwen 3.5 27B, 2026-11-04); 1 or `auto`,
+// they are launched as programmatic dependents of the kernel before them,
+// and a block lets the kernel after it launch as soon as it has started when
+// the stream runs eagerly, or once its output is written when the stream is
+// being captured into a CUDA graph (where the next kernel starts at the
+// trigger and its wait does not hold it: Gemma 4 26B's decode went
+// non-finite under TensorRT-RTX's whole-graph capture with the early
+// trigger); `early` and `late` force one trigger (diagnostics).
+enum class DependentLaunch { kOff, kAuto, kEarly, kLate };
+
+DependentLaunch DependentLaunchMode() {
+  static const DependentLaunch mode = [] {
+    const char* value = std::getenv("LITERT_NVIDIA_GEMV_DEPENDENT_LAUNCH");
+    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+      return DependentLaunch::kOff;
+    }
+    if (std::strcmp(value, "early") == 0) return DependentLaunch::kEarly;
+    if (std::strcmp(value, "late") == 0) return DependentLaunch::kLate;
+    return DependentLaunch::kAuto;
+  }();
+  return mode;
+}
+
+// Whether the stream is being captured into a CUDA graph (a stream joined to
+// a capture through an event counts).
+bool StreamCapturing(cudaStream_t stream) {
+  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+  return cudaStreamIsCapturing(stream, &status) == cudaSuccess &&
+         status != cudaStreamCaptureStatusNone;
+}
+
 template <int Rows, int Threads, int Gate>
 cudaError_t LaunchDense(const __nv_bfloat16* activation,
                         const uint8_t* weights, const __half* scales,
@@ -127,10 +187,27 @@ cudaError_t LaunchDense(const __nv_bfloat16* activation,
   const auto launch = [&](auto tile_rows) {
     constexpr int kRows = decltype(tile_rows)::value;
     const int grid = (output_size + kRows - 1) / kRows;
-    DenseKernel<Rows, Threads, Gate, kRows><<<grid, Threads, 0, stream>>>(
-        activation, weights, scales, norm.scale, norm.eps, norm.multiplier,
-        output, input_size, output_size);
-    return cudaPeekAtLastError();
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(grid);
+    config.blockDim = dim3(Threads);
+    config.stream = stream;
+    cudaLaunchAttribute attribute{};
+    attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute.val.programmaticStreamSerializationAllowed = 1;
+    const DependentLaunch mode = DependentLaunchMode();
+    if (mode != DependentLaunch::kOff) {
+      config.attrs = &attribute;
+      config.numAttrs = 1;
+    }
+    const int trigger =
+        mode == DependentLaunch::kLate ||
+                (mode == DependentLaunch::kAuto && StreamCapturing(stream))
+            ? 1
+            : 0;
+    return cudaLaunchKernelEx(&config, DenseKernel<Rows, Threads, Gate, kRows>,
+                              activation, weights, scales, norm.scale, norm.eps,
+                              norm.multiplier, output, input_size, output_size,
+                              trigger);
   };
   if (output_size >= kDenseMinCtas * kTileRows) {
     return launch(std::integral_constant<int, kTileRows>());
@@ -160,6 +237,151 @@ cudaError_t LaunchDenseGate(const __nv_bfloat16* activation,
       return LaunchDense<Rows, Threads, 2>(activation, weights, scales, norm,
                                            output, input_size, output_size,
                                            stream);
+    case 3:
+      return LaunchDense<Rows, Threads, 3>(activation, weights, scales, norm,
+                                           output, input_size, output_size,
+                                           stream);
+    default:
+      return cudaErrorInvalidValue;
+  }
+}
+
+// Rows 2 to kLiteRtNvidiaInt4BlockGemvMaxRows (a verify step) on the tensor
+// cores (AccumulateMma): a CTA computes kMmaTile output channels of every
+// row (with a gate, those of the gate and of the up projection), its
+// kMmaWarps warps taking every kMmaWarps-th input block, and sums the warps'
+// results in a fixed order. With a gated feed-forward or the fused norm the
+// epilogue is DenseKernel's.
+constexpr int kMmaWarps = 4;
+constexpr int kMmaThreads = kMmaWarps * kWarpSize;
+static_assert(kMmaThreads == kMmaTile * kMmaRows,
+              "a thread of the epilogue per output of a tile");
+static_assert(kLiteRtNvidiaInt4BlockGemvMaxRows <= kMmaRows,
+              "a verify step's rows fit the MMA's columns");
+
+// Stores a warp's accumulators of kTiles tiles (AccumulateMma's layout) to
+// sums[warp][t][channel][row] and, with `norm`, the warp's sums of squares of
+// its rows to squares_s[warp][row].
+template <int kTiles>
+__device__ __forceinline__ void StoreWarpSums(
+    const float acc[kTiles][4], float squares, bool norm,
+    float (*sums)[kTiles][kMmaTile][kMmaRows], float (*squares_s)[kMmaRows]) {
+  const int warp = threadIdx.x / kWarpSize;
+  const int lane = threadIdx.x % kWarpSize;
+  const int g = lane / 4;
+  const int c = lane % 4;
+#pragma unroll
+  for (int t = 0; t < kTiles; ++t) {
+    sums[warp][t][g][2 * c] = acc[t][0];
+    sums[warp][t][g][2 * c + 1] = acc[t][1];
+    sums[warp][t][g + 8][2 * c] = acc[t][2];
+    sums[warp][t][g + 8][2 * c + 1] = acc[t][3];
+  }
+  if (norm) {
+    squares += __shfl_xor_sync(kFullWarpMask, squares, 1);
+    squares += __shfl_xor_sync(kFullWarpMask, squares, 2);
+    if (c == 0) squares_s[warp][g] = squares;
+  }
+}
+
+template <int Gate, bool kNorm>
+__global__ void __launch_bounds__(kMmaThreads)
+    DenseMmaKernel(const __nv_bfloat16* __restrict__ activation,
+                   const uint8_t* __restrict__ weights,
+                   const __half* __restrict__ scales,
+                   const float* __restrict__ norm_scale, float norm_eps,
+                   float norm_multiplier, __nv_bfloat16* __restrict__ output,
+                   int rows, int input_size, int output_size) {
+  constexpr int kTiles = Gate != 0 ? 2 : 1;
+  __shared__ MmaStage<kTiles> stages[kMmaWarps];
+  __shared__ float sums[kMmaWarps][kTiles][kMmaTile][kMmaRows];
+  __shared__ float squares_s[kMmaWarps][kMmaRows];
+  const int n0 = blockIdx.x * kMmaTile;
+  const int blocks = input_size / kBlock;
+  const size_t row_bytes = static_cast<size_t>(input_size) / 2;
+  const int valid = min(kMmaTile, output_size - n0);
+  WeightTile tiles[kTiles];
+#pragma unroll
+  for (int t = 0; t < kTiles; ++t) {
+    // The up projection's rows follow the gate's.
+    const size_t first = static_cast<size_t>(t) * output_size + n0;
+    tiles[t] = WeightTile{weights + first * row_bytes, row_bytes,
+                          scales + first * blocks,
+                          static_cast<size_t>(blocks), valid};
+  }
+  const ActivationRows<__nv_bfloat16> act{
+      activation, static_cast<size_t>(input_size), nullptr};
+  float acc[kTiles][4] = {};
+  float squares = 0.0f;
+  const int warp = threadIdx.x / kWarpSize;
+  AccumulateMma<__nv_bfloat16, kTiles, /*kCompact=*/false, kNorm>(
+      tiles, act, rows, input_size, warp, kMmaWarps, stages[warp], acc,
+      norm_scale, &squares);
+  StoreWarpSums<kTiles>(acc, squares, kNorm, sums, squares_s);
+  __syncthreads();
+  const int channel = threadIdx.x / kMmaRows;
+  const int r = threadIdx.x % kMmaRows;
+  if (r >= rows || channel >= valid) return;
+  float value = 0.0f;
+  float up = 0.0f;
+  float row_squares = 0.0f;
+#pragma unroll
+  for (int w = 0; w < kMmaWarps; ++w) {
+    value += sums[w][0][channel][r];
+    if constexpr (Gate != 0) up += sums[w][1][channel][r];
+    if constexpr (kNorm) row_squares += squares_s[w][r];
+  }
+  float row_factor = 1.0f;
+  if constexpr (kNorm) {
+    row_factor =
+        rsqrtf(row_squares / static_cast<float>(input_size) + norm_eps) *
+        norm_multiplier;
+  }
+  value *= row_factor;
+  if constexpr (Gate != 0) {
+    value = Gelu(value, Gate) * up * row_factor;
+  }
+  output[static_cast<size_t>(r) * output_size + n0 + channel] =
+      __float2bfloat16_rn(value);
+}
+
+template <int Gate>
+cudaError_t LaunchDenseMmaGate(const __nv_bfloat16* activation,
+                               const uint8_t* weights, const __half* scales,
+                               const DenseNorm& norm, __nv_bfloat16* output,
+                               int rows, int input_size, int output_size,
+                               cudaStream_t stream) {
+  const int grid = (output_size + kMmaTile - 1) / kMmaTile;
+  if (norm.scale != nullptr) {
+    DenseMmaKernel<Gate, true><<<grid, kMmaThreads, 0, stream>>>(
+        activation, weights, scales, norm.scale, norm.eps, norm.multiplier,
+        output, rows, input_size, output_size);
+  } else {
+    DenseMmaKernel<Gate, false><<<grid, kMmaThreads, 0, stream>>>(
+        activation, weights, scales, nullptr, 0.0f, 1.0f, output, rows,
+        input_size, output_size);
+  }
+  return cudaPeekAtLastError();
+}
+
+cudaError_t LaunchDenseMma(const __nv_bfloat16* activation,
+                           const uint8_t* weights, const __half* scales,
+                           const DenseNorm& norm, __nv_bfloat16* output,
+                           int rows, int input_size, int output_size, int gate,
+                           cudaStream_t stream) {
+  switch (gate) {
+    case 0:
+      return LaunchDenseMmaGate<0>(activation, weights, scales, norm, output,
+                                   rows, input_size, output_size, stream);
+    case 1:
+      return LaunchDenseMmaGate<1>(activation, weights, scales, norm, output,
+                                   rows, input_size, output_size, stream);
+    case 2:
+      return LaunchDenseMmaGate<2>(activation, weights, scales, norm, output,
+                                   rows, input_size, output_size, stream);
+    case 3:
+      return LaunchDenseMmaGate<3>(activation, weights, scales, norm, output,
+                                   rows, input_size, output_size, stream);
     default:
       return cudaErrorInvalidValue;
   }
@@ -193,30 +415,64 @@ cudaError_t LaunchDenseRows(const __nv_bfloat16* activation,
 static_assert(kLiteRtNvidiaInt4BlockGemvMaxRows == 8,
               "LaunchDenseRows instantiates rows 1 to 8");
 
+// The FP32 kernels (DenseKernel) at any row count: every row's sums are the
+// ones the row would get alone. The router's logits take them in a verify
+// step too, so that its rows choose their experts as decode would.
+cudaError_t LaunchDenseFp32(const __nv_bfloat16* activation,
+                            const uint8_t* weights, const __half* scales,
+                            const DenseNorm& norm, __nv_bfloat16* output,
+                            int rows, int input_size, int output_size,
+                            int gate, cudaStream_t stream) {
+  // As many warps as the input blocks fill, up to four: 22 blocks (an
+  // expert's down projection) one warp, 66 (the dense down projection)
+  // three, 88 and more four.
+  const int blocks = input_size / kBlock;
+  if (blocks <= 32) {
+    return LaunchDenseRows<32>(activation, weights, scales, norm, output, rows,
+                               input_size, output_size, gate, stream);
+  }
+  if (blocks <= 64) {
+    return LaunchDenseRows<64>(activation, weights, scales, norm, output, rows,
+                               input_size, output_size, gate, stream);
+  }
+  if (blocks <= 96) {
+    return LaunchDenseRows<96>(activation, weights, scales, norm, output, rows,
+                               input_size, output_size, gate, stream);
+  }
+  return LaunchDenseRows<128>(activation, weights, scales, norm, output, rows,
+                              input_size, output_size, gate, stream);
+}
+
 // --- Mixture of experts -----------------------------------------------------
 
 constexpr int kMaxTopK = 32;
 constexpr int kMaxExperts = 1024;
 constexpr int kPairRows = kTileRows;  // routed (row, slot) pairs per chunk
 
-// The weight tile of expert `expert`'s output rows [o0, o0 + kTileRows) of a
-// projection whose rows interleave the experts.
+// The weight tile of expert `expert`'s output rows [o0, o0 + tile_rows) of a
+// projection whose rows interleave the experts (the model's order) or follow
+// each other expert by expert (`expert_major`).
 __device__ __forceinline__ WeightTile ExpertTile(const uint8_t* weights,
                                                  const void* scales,
                                                  const void* scale_max,
-                                                 int compact, int experts,
-                                                 int expert, int o0,
-                                                 int out_rows,
-                                                 int input_size) {
+                                                 int compact, int expert_major,
+                                                 int experts, int expert,
+                                                 int o0, int out_rows,
+                                                 int input_size,
+                                                 int tile_rows = kTileRows) {
   const size_t row_bytes = static_cast<size_t>(input_size) / 2;
   const size_t blocks = static_cast<size_t>(input_size) / kBlock;
-  const size_t first = static_cast<size_t>(o0) * experts + expert;
-  WeightTile tile{weights + first * row_bytes, row_bytes * experts, nullptr,
-                  blocks * experts, min(kTileRows, out_rows - o0)};
+  // The expert's first row of the tile, and the rows from one to the next.
+  const size_t first = expert_major != 0
+                           ? static_cast<size_t>(expert) * out_rows + o0
+                           : static_cast<size_t>(o0) * experts + expert;
+  const size_t step = expert_major != 0 ? 1 : experts;
+  WeightTile tile{weights + first * row_bytes, row_bytes * step, nullptr,
+                  blocks * step, min(tile_rows, out_rows - o0)};
   if (compact != 0) {
     tile.fractions = static_cast<const uint8_t*>(scales) + first * blocks;
     tile.scale_max = static_cast<const __half*>(scale_max) + first;
-    tile.max_stride = experts;
+    tile.max_stride = step;
   } else {
     tile.scales = static_cast<const __half*>(scales) + first * blocks;
   }
@@ -381,15 +637,15 @@ __global__ void __launch_bounds__(Threads)
   float up_squares[1] = {};
   AccumulateTile<__nv_bfloat16, 1, Threads, kTileRows, kCompact>(
       ExpertTile(arena.gate, arena.gate_scales, arena.gate_scale_max,
-                 arena.compact_scales, shape.experts, expert, o0,
-                 shape.hidden_dim, shape.model_dim),
+                 arena.compact_scales, arena.expert_major, shape.experts,
+                 expert, o0, shape.hidden_dim, shape.model_dim),
       act, shape.model_dim, gate, norm_scale, squares);
   ReduceTile<1, Threads>(gate, warp_sums);
   __syncthreads();
   AccumulateTile<__nv_bfloat16, 1, Threads, kTileRows, kCompact>(
       ExpertTile(arena.up, arena.up_scales, arena.up_scale_max,
-                 arena.compact_scales, shape.experts, expert, o0,
-                 shape.hidden_dim, shape.model_dim),
+                 arena.compact_scales, arena.expert_major, shape.experts,
+                 expert, o0, shape.hidden_dim, shape.model_dim),
       act, shape.model_dim, up, norm_scale, up_squares);
   ReduceTile<1, Threads>(up, warp_sums);
   float factor = 1.0f;
@@ -408,6 +664,330 @@ __global__ void __launch_bounds__(Threads)
       }
     }
   }
+}
+
+// A few rows (a verify step: 2 to kLiteRtNvidiaInt4BlockGemvMaxRows) grouped
+// by expert (LiteRtNvidiaMoeArena::group_rows): a group holds up to
+// kGroupMaxRows routed (row, slot) pairs of one expert, in pair order, and
+// the groups come in the order of their first pair, empty slots after them.
+// The table takes the place of the router's logits in the workspace, which
+// nothing reads once the rows are routed. The grouped kernels multiply on the
+// tensor cores (a group's rows are the MMA's columns) and read compact scales
+// only, the format the plugin loads.
+constexpr int kGroupMaxRows = kLiteRtNvidiaInt4BlockGemvMaxRows;
+static_assert(kGroupMaxRows <= kMmaRows, "a group's rows fit the MMA");
+constexpr int kGroupMaxPairs = kGroupMaxRows * kMaxTopK;
+constexpr int kNoExpert = 0xffff;
+
+struct MoeGroup {
+  uint16_t expert;  // kNoExpert: a pair routed to no expert
+  uint8_t count;    // 0: an empty slot
+  uint8_t pairs[kGroupMaxRows];
+};
+
+// Eight BF16 values (one 16-byte word) as four float pairs.
+__device__ __forceinline__ void WordPairs(uint4 bits, float2 pairs[4]) {
+  const uint32_t words[4] = {bits.x, bits.y, bits.z, bits.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    pairs[i] = __bfloat1622float2(
+        *reinterpret_cast<const __nv_bfloat162*>(&words[i]));
+  }
+}
+
+// The grouped launch's prologue. Block 0, a thread per pair: with `logits`
+// (the fused launches), warp r routes row r as MoeRouteKernel does into
+// route_indices and route_weights, which top_indices then is, and the pairs
+// of top_indices are grouped by expert into `groups`. With `norm_scale` (the
+// expert norm), block 1 + r splits row r's values times the scale into hi and
+// lo [rows, model_dim] (SplitPair) and puts its RMS factor in factors[r], the
+// sum of squares taken in the order the grouped hidden kernel took it in
+// every group before (AccumulateMma's per lane, then StoreWarpSums' and the
+// epilogue's): the kernel then reads the products' operands and factors it
+// computed. One launch where the routing, the grouping and the norm took
+// three before, and the split done once instead of in every group.
+__global__ void __launch_bounds__(kGroupMaxPairs)
+    MoeRouteGroupKernel(const __nv_bfloat16* __restrict__ logits,
+                        int renormalize, int32_t* route_indices,
+                        float* route_weights, const int32_t* top_indices,
+                        const __nv_bfloat16* __restrict__ activation,
+                        const float* __restrict__ norm_scale, float norm_eps,
+                        LiteRtNvidiaMoeShape shape, MoeGroup* groups,
+                        __nv_bfloat16* __restrict__ hi,
+                        __nv_bfloat16* __restrict__ lo,
+                        float* __restrict__ factors) {
+  if (blockIdx.x > 0) {
+    // The norm comes with the fused launches only: model_dim <= kMaxRouteDim.
+    __shared__ uint4 row_s[kMaxRouteDim / 8];
+    __shared__ float squares_s[kMmaWarps][4];
+    const int r = blockIdx.x - 1;
+    const int words = shape.model_dim / 8;
+    const uint4* row = reinterpret_cast<const uint4*>(activation) +
+                       static_cast<size_t>(r) * words;
+    for (int i = threadIdx.x; i < words; i += blockDim.x) {
+      row_s[i] = __ldg(row + i);
+    }
+    __syncthreads();
+    if (threadIdx.x < kMmaWarps * 4) {
+      // Lane c of warp w of the grouped kernel: elements 8c to 8c + 7 of the
+      // blocks of its groups of kMmaUnroll, in order.
+      const int w = threadIdx.x / 4;
+      const int c = threadIdx.x % 4;
+      const int blocks = shape.model_dim / kBlock;
+      float squares = 0.0f;
+      for (int b0 = w * kMmaUnroll; b0 < blocks;
+           b0 += kMmaWarps * kMmaUnroll) {
+#pragma unroll
+        for (int u = 0; u < kMmaUnroll; ++u) {
+          if (b0 + u >= blocks) break;
+          float2 raw[4];
+          WordPairs(row_s[(b0 + u) * (kBlock / 8) + c], raw);
+#pragma unroll
+          for (int n = 0; n < 4; ++n) {
+            squares = fmaf(raw[n].x, raw[n].x, squares);
+            squares = fmaf(raw[n].y, raw[n].y, squares);
+          }
+        }
+      }
+      squares_s[w][c] = squares;
+    }
+    for (int i = threadIdx.x; i < words; i += blockDim.x) {
+      float2 raw[4];
+      float2 scale[4];
+      WordPairs(row_s[i], raw);
+      LoadPairs<float>(norm_scale + 8 * i, scale);
+      uint32_t high[4];
+      uint32_t low[4];
+#pragma unroll
+      for (int n = 0; n < 4; ++n) {
+        SplitPair(__fmul_rn(raw[n].x, scale[n].x),
+                  __fmul_rn(raw[n].y, scale[n].y), high[n], low[n]);
+      }
+      const size_t at = static_cast<size_t>(r) * words + i;
+      reinterpret_cast<uint4*>(hi)[at] =
+          make_uint4(high[0], high[1], high[2], high[3]);
+      reinterpret_cast<uint4*>(lo)[at] =
+          make_uint4(low[0], low[1], low[2], low[3]);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float total = 0.0f;
+#pragma unroll
+      for (int w = 0; w < kMmaWarps; ++w) {
+        total += (squares_s[w][0] + squares_s[w][1]) +
+                 (squares_s[w][2] + squares_s[w][3]);
+      }
+      factors[r] =
+          rsqrtf(total / static_cast<float>(shape.model_dim) + norm_eps);
+    }
+    return;
+  }
+  __shared__ int32_t expert_s[kGroupMaxPairs];
+  __shared__ int32_t rank_s[kGroupMaxPairs];
+  __shared__ int32_t leader_s[kGroupMaxPairs];
+  __shared__ int32_t slot_s[kGroupMaxPairs];
+  const int pairs = shape.rows * shape.top_k;
+  const int experts = shape.experts;
+  const int warp = threadIdx.x / kWarpSize;
+  if (logits != nullptr && warp < shape.rows) {
+    const __nv_bfloat16* src =
+        logits + static_cast<size_t>(warp) * shape.experts;
+    int32_t* indices =
+        route_indices + static_cast<size_t>(warp) * shape.top_k;
+    float* weights = route_weights + static_cast<size_t>(warp) * shape.top_k;
+    if (shape.experts <= 4 * kWarpSize) {
+      RouteRow<4>(src, shape.experts, shape.top_k, /*slot=*/0, renormalize,
+                  /*write=*/true, threadIdx.x % kWarpSize, indices, weights);
+    } else {
+      RouteRow<kMaxExperts / kWarpSize>(
+          src, shape.experts, shape.top_k, /*slot=*/0, renormalize,
+          /*write=*/true, threadIdx.x % kWarpSize, indices, weights);
+    }
+  }
+  __syncthreads();  // the routing's indices
+  const int p = threadIdx.x;
+  if (p < pairs) {
+    const int expert = top_indices[p];
+    expert_s[p] = expert >= 0 && expert < experts ? expert : kNoExpert;
+  }
+  __syncthreads();
+  // The pair's rank among the pairs of its expert: every kGroupMaxRows of
+  // them are a group (one row routes to an expert once, so the routing's own
+  // groups never split). A pair without an expert is a group of its own.
+  if (p < pairs) {
+    int rank = 0;
+    if (expert_s[p] != kNoExpert) {
+      for (int q = 0; q < p; ++q) rank += expert_s[q] == expert_s[p] ? 1 : 0;
+    }
+    rank_s[p] = rank;
+  }
+  __syncthreads();
+  if (p < pairs) {
+    int leader = p;
+    if (expert_s[p] != kNoExpert) {
+      const int first = rank_s[p] - rank_s[p] % kGroupMaxRows;
+      for (int q = 0; q < p; ++q) {
+        if (expert_s[q] == expert_s[p] && rank_s[q] == first) {
+          leader = q;
+          break;
+        }
+      }
+    }
+    leader_s[p] = leader;
+  }
+  __syncthreads();
+  if (p == 0) {
+    int slot = 0;
+    for (int q = 0; q < pairs; ++q) {
+      if (leader_s[q] == q) slot_s[q] = slot++;
+    }
+    for (; slot < pairs; ++slot) groups[slot].count = 0;
+  }
+  __syncthreads();
+  if (p < pairs && leader_s[p] == p) {
+    MoeGroup group;
+    group.expert = static_cast<uint16_t>(expert_s[p]);
+    int count = 0;
+    for (int q = p; q < pairs && count < kGroupMaxRows; ++q) {
+      if (leader_s[q] == p) group.pairs[count++] = static_cast<uint8_t>(q);
+    }
+    for (int i = count; i < kGroupMaxRows; ++i) group.pairs[i] = 0;
+    group.count = static_cast<uint8_t>(count);
+    groups[slot_s[p]] = group;
+  }
+}
+
+// A group's rows on the tensor cores (AccumulateMma): the expert's tile of
+// kMmaTile rows is read once for all of them. Grid (hidden_dim / kMmaTile,
+// rows * top_k): block (tile, group slot).
+//   hidden[pair][o] = gelu(x_r . gate_e) * (x_r . up_e)
+// With kNorm the rows are the prologue's split ones (norm_hi, norm_lo and
+// factors, MoeRouteGroupKernel); the hidden values go out as the high and
+// low parts the down projection multiplies (hidden_hi, hidden_lo).
+template <bool kNorm>
+__global__ void __launch_bounds__(kMmaThreads)
+    MoeHiddenGroupedKernel(const __nv_bfloat16* __restrict__ activation,
+                           const MoeGroup* __restrict__ groups,
+                           const __nv_bfloat16* __restrict__ norm_hi,
+                           const __nv_bfloat16* __restrict__ norm_lo,
+                           const float* __restrict__ factors,
+                           LiteRtNvidiaMoeArena arena,
+                           LiteRtNvidiaMoeShape shape,
+                           __nv_bfloat16* __restrict__ hidden_hi,
+                           __nv_bfloat16* __restrict__ hidden_lo) {
+  __shared__ MmaStage<2> stages[kMmaWarps];
+  __shared__ float sums[kMmaWarps][2][kMmaTile][kMmaRows];
+  __shared__ int32_t rows_s[kMmaRows];
+  const MoeGroup group = groups[blockIdx.y];
+  if (group.count == 0 || group.expert == kNoExpert) return;
+  if (threadIdx.x < kMmaRows) {
+    rows_s[threadIdx.x] =
+        group.pairs[threadIdx.x < group.count ? threadIdx.x : 0] /
+        shape.top_k;
+  }
+  __syncthreads();
+  const int o0 = blockIdx.x * kMmaTile;
+  const WeightTile tiles[2] = {
+      ExpertTile(arena.gate, arena.gate_scales, arena.gate_scale_max,
+                 arena.compact_scales, arena.expert_major, shape.experts,
+                 group.expert, o0, shape.hidden_dim, shape.model_dim,
+                 kMmaTile),
+      ExpertTile(arena.up, arena.up_scales, arena.up_scale_max,
+                 arena.compact_scales, arena.expert_major, shape.experts,
+                 group.expert, o0, shape.hidden_dim, shape.model_dim,
+                 kMmaTile)};
+  float acc[2][4] = {};
+  const int warp = threadIdx.x / kWarpSize;
+  if constexpr (kNorm) {
+    const ActivationRows<__nv_bfloat16> act{
+        norm_hi, static_cast<size_t>(shape.model_dim), rows_s, norm_lo};
+    AccumulateMma<__nv_bfloat16, 2, /*kCompact=*/true, /*kNorm=*/false,
+                  /*kPreSplit=*/true>(tiles, act, group.count,
+                                      shape.model_dim, warp, kMmaWarps,
+                                      stages[warp], acc, nullptr, nullptr);
+  } else {
+    const ActivationRows<__nv_bfloat16> act{
+        activation, static_cast<size_t>(shape.model_dim), rows_s};
+    AccumulateMma<__nv_bfloat16, 2, /*kCompact=*/true, /*kNorm=*/false>(
+        tiles, act, group.count, shape.model_dim, warp, kMmaWarps,
+        stages[warp], acc, nullptr, nullptr);
+  }
+  StoreWarpSums<2>(acc, 0.0f, false, sums, nullptr);
+  __syncthreads();
+  const int channel = threadIdx.x / kMmaRows;
+  const int r = threadIdx.x % kMmaRows;
+  if (r >= group.count || channel >= tiles[0].valid_rows) return;
+  float gate = 0.0f;
+  float up = 0.0f;
+#pragma unroll
+  for (int w = 0; w < kMmaWarps; ++w) {
+    gate += sums[w][0][channel][r];
+    up += sums[w][1][channel][r];
+  }
+  const float factor = kNorm ? factors[rows_s[r]] : 1.0f;
+  // Rounded before its low part is taken, as the FP32 value it was.
+  const float value = __fmul_rn(Gelu(gate * factor, shape.gate) * up, factor);
+  const __nv_bfloat16 high = __float2bfloat16_rn(value);
+  const size_t at =
+      static_cast<size_t>(group.pairs[r]) * shape.hidden_dim + o0 + channel;
+  hidden_hi[at] = high;
+  hidden_lo[at] = __float2bfloat16_rn(value - __bfloat162float(high));
+}
+
+// partial[pair][o] = w_pair * (hidden[pair] . down_e[o]) for the pairs of a
+// group, on the tensor cores, from the hidden rows as the hidden kernel split
+// them. Grid (model_dim / kMmaTile, rows * top_k): block (tile, group slot).
+__global__ void __launch_bounds__(kMmaThreads)
+    MoeDownGroupedKernel(const __nv_bfloat16* __restrict__ hidden_hi,
+                         const __nv_bfloat16* __restrict__ hidden_lo,
+                         const MoeGroup* __restrict__ groups,
+                         const float* __restrict__ top_weights,
+                         const float* __restrict__ per_expert_scale,
+                         LiteRtNvidiaMoeArena arena, LiteRtNvidiaMoeShape shape,
+                         float* __restrict__ partial) {
+  __shared__ MmaStage<1> stages[kMmaWarps];
+  __shared__ float sums[kMmaWarps][1][kMmaTile][kMmaRows];
+  __shared__ int32_t pairs_s[kMmaRows];
+  const MoeGroup group = groups[blockIdx.y];
+  if (group.count == 0) return;
+  const int o0 = blockIdx.x * kMmaTile;
+  const int valid = min(kMmaTile, shape.model_dim - o0);
+  if (group.expert == kNoExpert) {
+    // The pair's partial is zero, as the pair's own block writes it.
+    float* dst =
+        partial + static_cast<size_t>(group.pairs[0]) * shape.model_dim + o0;
+    if (threadIdx.x < valid) dst[threadIdx.x] = 0.0f;
+    return;
+  }
+  if (threadIdx.x < kMmaRows) {
+    pairs_s[threadIdx.x] =
+        group.pairs[threadIdx.x < group.count ? threadIdx.x : 0];
+  }
+  __syncthreads();
+  const WeightTile tiles[1] = {
+      ExpertTile(arena.down, arena.down_scales, arena.down_scale_max,
+                 arena.compact_scales, arena.expert_major, shape.experts,
+                 group.expert, o0, shape.model_dim, shape.hidden_dim,
+                 kMmaTile)};
+  const ActivationRows<__nv_bfloat16> act{
+      hidden_hi, static_cast<size_t>(shape.hidden_dim), pairs_s, hidden_lo};
+  float acc[1][4] = {};
+  const int warp = threadIdx.x / kWarpSize;
+  AccumulateMma<__nv_bfloat16, 1, /*kCompact=*/true, /*kNorm=*/false,
+                /*kPreSplit=*/true>(tiles, act, group.count,
+                                    shape.hidden_dim, warp, kMmaWarps,
+                                    stages[warp], acc, nullptr, nullptr);
+  StoreWarpSums<1>(acc, 0.0f, false, sums, nullptr);
+  __syncthreads();
+  const int channel = threadIdx.x / kMmaRows;
+  const int r = threadIdx.x % kMmaRows;
+  if (r >= group.count || channel >= valid) return;
+  float value = 0.0f;
+#pragma unroll
+  for (int w = 0; w < kMmaWarps; ++w) value += sums[w][0][channel][r];
+  const int pair = pairs_s[r];
+  partial[static_cast<size_t>(pair) * shape.model_dim + o0 + channel] =
+      top_weights[pair] * per_expert_scale[group.expert] * value;
 }
 
 // Decode: grid (model_dim / kTileRows, rows * top_k). partial[pair][o] =
@@ -440,8 +1020,8 @@ __global__ void __launch_bounds__(Threads)
   float acc[1][kTileRows] = {};
   AccumulateTile<float, 1, Threads, kTileRows, kCompact>(
       ExpertTile(arena.down, arena.down_scales, arena.down_scale_max,
-                 arena.compact_scales, shape.experts, expert, o0,
-                 shape.model_dim, shape.hidden_dim),
+                 arena.compact_scales, arena.expert_major, shape.experts,
+                 expert, o0, shape.model_dim, shape.hidden_dim),
       act, shape.hidden_dim, acc);
   ReduceTile<1, Threads>(acc, warp_sums);
   if (threadIdx.x == 0) {
@@ -596,6 +1176,24 @@ __global__ void MoeCombineKernel(const float* __restrict__ partial, int top_k,
   output[static_cast<size_t>(row) * model_dim + o] = __float2bfloat16_rn(sum);
 }
 
+// The rows of some output channels of a projection from the model's order
+// to their places in an expert-major one (LiteRtNvidiaLaunchMoeExpertRows),
+// a thread per 16 bytes.
+__global__ void MoeExpertRowsKernel(const uint4* __restrict__ model_rows,
+                                    uint4* __restrict__ expert_rows,
+                                    int first_channel, int experts,
+                                    int expert_channels, int row_words,
+                                    size_t words) {
+  const size_t word =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (word >= words) return;
+  const size_t row = word / row_words;
+  const size_t channel = first_channel + row / experts;
+  const size_t expert = row % experts;
+  expert_rows[(expert * expert_channels + channel) * row_words +
+              word % row_words] = model_rows[word];
+}
+
 // Prefill routing: the (row, slot) pairs grouped by expert.
 //   counts[e]      pairs routed to e
 //   offsets[e]     exclusive prefix sum of counts (offsets[experts] = total)
@@ -677,6 +1275,8 @@ __global__ void __launch_bounds__(kMaxExperts)
 // the unused tiles.
 //   tile_experts[t]   the expert of tile t, or -1
 //   row_source[r]     the token of padded row r, -1 for a zero row, -2 unused
+//                     (also the rows of a GEMM block with none of the
+//                     expert's rows, which the GEMMs skip)
 //   row_self[r]       r for a row in use, -2 otherwise (the hidden pre-pass)
 //   pair_row[pair]    the padded row of a routed pair
 __global__ void MoeTileFillKernel(const int32_t* __restrict__ counts,
@@ -713,10 +1313,16 @@ __global__ void MoeTileFillKernel(const int32_t* __restrict__ counts,
       const int pair = grouped[offsets[e] + i];
       row_source[row] = pair / top_k;
       pair_row[pair] = row;
-    } else {
+      row_self[row] = row;
+    } else if (i / kLiteRtNvidiaGroupedGemmBlockRows *
+                   kLiteRtNvidiaGroupedGemmBlockRows <
+               count) {
       row_source[row] = -1;
+      row_self[row] = row;
+    } else {
+      row_source[row] = -2;
+      row_self[row] = -2;
     }
-    row_self[row] = row;
   }
 }
 
@@ -856,6 +1462,19 @@ MoeWorkspace LayoutWorkspace(const LiteRtNvidiaMoeShape& shape,
   return w;
 }
 
+// Whether the launch groups the rows by expert: the arena asks for it and
+// holds compact scales, the rows are a verify step's, and the groups fit
+// where the logits were.
+bool GroupsRows(const LiteRtNvidiaMoeShape& shape,
+                const LiteRtNvidiaMoeArena& arena) {
+  return arena.group_rows != 0 && arena.compact_scales != 0 &&
+         shape.rows >= 2 &&
+         shape.rows <= kLiteRtNvidiaInt4BlockGemvMaxRows &&
+         static_cast<size_t>(shape.rows) * shape.top_k * sizeof(MoeGroup) <=
+             RoundUp256(static_cast<size_t>(shape.rows) * shape.experts *
+                        sizeof(uint16_t));
+}
+
 template <int Threads>
 cudaError_t LaunchMoe(const LiteRtNvidiaMoeShape& shape,
                       const LiteRtNvidiaMoeArena& arena,
@@ -879,30 +1498,72 @@ cudaError_t LaunchMoe(const LiteRtNvidiaMoeShape& shape,
     const dim3 down_grid(model_tiles, shape.rows * shape.top_k);
     auto* route_indices = reinterpret_cast<int32_t*>(workspace + w.top_indices);
     auto* route_weights = reinterpret_cast<float*>(workspace + w.top_weights);
-    if (arena.compact_scales != 0) {
-      MoeHiddenKernel<Threads, true><<<hidden_grid, Threads, 0, stream>>>(
-          activation, top_indices, logits, renormalize, route_indices,
-          route_weights, norm_scale, norm_eps, arena, shape, hidden);
+    cudaError_t status;
+    if (GroupsRows(shape, arena)) {
+      // An expert's tile rows are read once for the rows that route to it.
+      // The prologue routes the rows (fused launches: from the logits, which
+      // the groups then replace) and splits the normed ones.
+      auto* groups = reinterpret_cast<MoeGroup*>(workspace + w.logits);
+      const int pairs = shape.rows * shape.top_k;
+      auto* norm_hi = reinterpret_cast<__nv_bfloat16*>(partial);
+      __nv_bfloat16* norm_lo =
+          norm_hi + static_cast<size_t>(shape.rows) * shape.model_dim;
+      auto* factors = reinterpret_cast<float*>(
+          norm_lo + static_cast<size_t>(shape.rows) * shape.model_dim);
+      auto* hidden_hi = reinterpret_cast<__nv_bfloat16*>(hidden);
+      __nv_bfloat16* hidden_lo =
+          hidden_hi + static_cast<size_t>(pairs) * shape.hidden_dim;
+      const int prologue_blocks = norm_scale != nullptr ? 1 + shape.rows : 1;
+      MoeRouteGroupKernel<<<prologue_blocks, kGroupMaxPairs, 0, stream>>>(
+          logits, renormalize, route_indices, route_weights, top_indices,
+          activation, norm_scale, norm_eps, shape, groups, norm_hi, norm_lo,
+          factors);
+      const dim3 hidden_mma_grid((shape.hidden_dim + kMmaTile - 1) / kMmaTile,
+                                 pairs);
+      const dim3 down_mma_grid((shape.model_dim + kMmaTile - 1) / kMmaTile,
+                               pairs);
+      if (norm_scale != nullptr) {
+        MoeHiddenGroupedKernel<true>
+            <<<hidden_mma_grid, kMmaThreads, 0, stream>>>(
+                activation, groups, norm_hi, norm_lo, factors, arena, shape,
+                hidden_hi, hidden_lo);
+      } else {
+        MoeHiddenGroupedKernel<false>
+            <<<hidden_mma_grid, kMmaThreads, 0, stream>>>(
+                activation, groups, nullptr, nullptr, nullptr, arena, shape,
+                hidden_hi, hidden_lo);
+      }
+      MoeDownGroupedKernel<<<down_mma_grid, kMmaThreads, 0, stream>>>(
+          hidden_hi, hidden_lo, groups, top_weights, per_expert_scale, arena,
+          shape, partial);
+      status = cudaPeekAtLastError();
+      if (status != cudaSuccess) return status;
     } else {
-      MoeHiddenKernel<Threads, false><<<hidden_grid, Threads, 0, stream>>>(
-          activation, top_indices, logits, renormalize, route_indices,
-          route_weights, norm_scale, norm_eps, arena, shape, hidden);
+      if (arena.compact_scales != 0) {
+        MoeHiddenKernel<Threads, true><<<hidden_grid, Threads, 0, stream>>>(
+            activation, top_indices, logits, renormalize, route_indices,
+            route_weights, norm_scale, norm_eps, arena, shape, hidden);
+      } else {
+        MoeHiddenKernel<Threads, false><<<hidden_grid, Threads, 0, stream>>>(
+            activation, top_indices, logits, renormalize, route_indices,
+            route_weights, norm_scale, norm_eps, arena, shape, hidden);
+      }
+      status = cudaPeekAtLastError();
+      if (status != cudaSuccess) return status;
+      if (arena.compact_scales != 0) {
+        MoeDownKernel<kDownThreads, true>
+            <<<down_grid, kDownThreads, 0, stream>>>(
+                hidden, top_indices, top_weights, per_expert_scale, arena,
+                shape, partial);
+      } else {
+        MoeDownKernel<kDownThreads, false>
+            <<<down_grid, kDownThreads, 0, stream>>>(
+                hidden, top_indices, top_weights, per_expert_scale, arena,
+                shape, partial);
+      }
+      status = cudaPeekAtLastError();
+      if (status != cudaSuccess) return status;
     }
-    cudaError_t status = cudaPeekAtLastError();
-    if (status != cudaSuccess) return status;
-    if (arena.compact_scales != 0) {
-      MoeDownKernel<kDownThreads, true>
-          <<<down_grid, kDownThreads, 0, stream>>>(hidden, top_indices,
-                                                   top_weights, per_expert_scale,
-                                                   arena, shape, partial);
-    } else {
-      MoeDownKernel<kDownThreads, false>
-          <<<down_grid, kDownThreads, 0, stream>>>(hidden, top_indices,
-                                                   top_weights, per_expert_scale,
-                                                   arena, shape, partial);
-    }
-    status = cudaPeekAtLastError();
-    if (status != cudaSuccess) return status;
     if (block != nullptr) {
       return LaunchBlockEpilogue<false>(shape, *block, partial, nullptr,
                                         nullptr, top_indices, top_weights,
@@ -957,6 +1618,13 @@ cudaError_t LaunchMoe(const LiteRtNvidiaMoeShape& shape,
       activation, row_source, padded, shape.model_dim, norm_scale, norm_eps,
       1.0f, row_scale, scaled_x, stream);
   if (status != cudaSuccess) return status;
+  // The rows from a channel of an expert to its next channel, and from an
+  // expert to the next: the model's order interleaves the experts.
+  const uint64_t channel_rows = arena.expert_major != 0 ? 1 : shape.experts;
+  const uint64_t gate_expert_rows =
+      arena.expert_major != 0 ? shape.hidden_dim : 1;
+  const uint64_t down_expert_rows =
+      arena.expert_major != 0 ? shape.model_dim : 1;
   const uint64_t model_row_bytes = static_cast<uint64_t>(shape.model_dim) / 2;
   const uint64_t model_scales = static_cast<uint64_t>(shape.model_dim) / kBlock;
   const LiteRtNvidiaGroupedGemmWeights gate_up = {
@@ -964,16 +1632,18 @@ cudaError_t LaunchMoe(const LiteRtNvidiaMoeShape& shape,
       arena.up,
       arena.gate_scales,
       arena.up_scales,
-      model_row_bytes * shape.experts,
-      model_scales * shape.experts,
-      model_row_bytes,
-      model_scales,
+      model_row_bytes * channel_rows,
+      model_scales * channel_rows,
+      model_row_bytes * gate_expert_rows,
+      model_scales * gate_expert_rows,
       tile_experts,
       arena.gate_scale_max,
       arena.up_scale_max,
-      static_cast<uint64_t>(shape.experts),
-      1,
-      arena.compact_scales};
+      channel_rows,
+      gate_expert_rows,
+      arena.compact_scales,
+      row_source,
+      arena.host_memory};
   const LiteRtNvidiaGemmShape gate_shape = {padded, shape.model_dim,
                                             shape.hidden_dim, shape.gate, 32};
   status = LiteRtNvidiaLaunchBf16Int4GroupedGemm(
@@ -991,16 +1661,18 @@ cudaError_t LaunchMoe(const LiteRtNvidiaMoeShape& shape,
       nullptr,
       arena.down_scales,
       nullptr,
-      hidden_row_bytes * shape.experts,
-      hidden_scales * shape.experts,
-      hidden_row_bytes,
-      hidden_scales,
+      hidden_row_bytes * channel_rows,
+      hidden_scales * channel_rows,
+      hidden_row_bytes * down_expert_rows,
+      hidden_scales * down_expert_rows,
       tile_experts,
       arena.down_scale_max,
       nullptr,
-      static_cast<uint64_t>(shape.experts),
-      1,
-      arena.compact_scales};
+      channel_rows,
+      down_expert_rows,
+      arena.compact_scales,
+      row_source,
+      arena.host_memory};
   const LiteRtNvidiaGemmShape down_shape = {
       padded, shape.hidden_dim, shape.model_dim, kLiteRtNvidiaGemmGateNone, 32};
   status = LiteRtNvidiaLaunchBf16Int4GroupedGemm(
@@ -1044,6 +1716,30 @@ extern "C" void LiteRtNvidiaCompactScaleRow(const float* scales,
     const int value = static_cast<int>(fraction);
     fractions[b] = static_cast<uint8_t>(value < 0 ? 0 : value > 255 ? 255 : value);
   }
+}
+
+extern "C" cudaError_t LiteRtNvidiaLaunchMoeExpertRows(
+    const void* model_rows, void* expert_rows, int32_t first_channel,
+    int32_t channels, int32_t experts, int32_t expert_channels,
+    int32_t row_bytes, cudaStream_t stream) {
+  using namespace litert::nvidia::int4_block;
+  if (model_rows == nullptr || expert_rows == nullptr || first_channel < 0 ||
+      channels < 1 || experts < 1 || channels > expert_channels ||
+      first_channel > expert_channels - channels || row_bytes < 16 ||
+      row_bytes % 16 != 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int kThreads = 256;
+  const size_t words =
+      static_cast<size_t>(channels) * experts * (row_bytes / 16);
+  const size_t blocks = (words + kThreads - 1) / kThreads;
+  if (blocks > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+    return cudaErrorInvalidValue;
+  }
+  MoeExpertRowsKernel<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
+      static_cast<const uint4*>(model_rows), static_cast<uint4*>(expert_rows),
+      first_channel, experts, expert_channels, row_bytes / 16, words);
+  return cudaPeekAtLastError();
 }
 
 extern "C" bool LiteRtNvidiaMoeSupports(const LiteRtNvidiaMoeShape* shape) {
@@ -1136,6 +1832,19 @@ cudaError_t LaunchMoeChecked(const LiteRtNvidiaMoeShape* shape,
                          static_cast<char*>(workspace), typed_output, stream,
                          block, logits, renormalize);
   }
+  // Up to 96 input blocks (the 26B's 88): 96-thread hidden blocks. A thread
+  // still takes one input block as with 128, and the fourth warp would only
+  // add zeros after the others to sums that start at +0, so the bits are the
+  // same. The kernel holds 128 registers a thread: five 96-thread blocks fit
+  // a multiprocessor where four of 128 did, and the 26B's 704 blocks of a
+  // decode step take 1.7 waves on the 5080 instead of 2.1 (expert launch
+  // 39.0 to 37.2 us).
+  if (shape->model_dim / kBlock <= 3 * kWarpSize) {
+    return LaunchMoe<96>(*shape, *arena, typed_activation, top_indices,
+                         top_weights, per_expert_scale, norm_scale, norm_eps,
+                         static_cast<char*>(workspace), typed_output, stream,
+                         block, logits, renormalize);
+  }
   return LaunchMoe<128>(*shape, *arena, typed_activation, top_indices,
                         top_weights, per_expert_scale, norm_scale, norm_eps,
                         static_cast<char*>(workspace), typed_output, stream,
@@ -1176,10 +1885,11 @@ cudaError_t LaunchFusedRouting(const LiteRtNvidiaMoeShape* shape,
   // over many (prefill rows are a multiple of 128).
   cudaError_t status;
   if (shape->rows <= kLiteRtNvidiaInt4BlockGemvMaxRows) {
-    status = LiteRtNvidiaLaunchBf16Int4BlockGemvRowsNormed(
-        activation, arena->router, arena->router_scales, router_norm_scale,
-        norm_eps, router_multiplier, logits, shape->rows, shape->model_dim,
-        shape->experts, /*gate=*/0, stream);
+    status = LaunchDenseFp32(
+        static_cast<const __nv_bfloat16*>(activation), arena->router,
+        static_cast<const __half*>(arena->router_scales),
+        DenseNorm{router_norm_scale, norm_eps, router_multiplier}, logits,
+        shape->rows, shape->model_dim, shape->experts, /*gate=*/0, stream);
   } else {
     const LiteRtNvidiaGemmShape router = {shape->rows, shape->model_dim,
                                           shape->experts,
@@ -1194,7 +1904,8 @@ cudaError_t LaunchFusedRouting(const LiteRtNvidiaMoeShape* shape,
   }
   if (status != cudaSuccess) return status;
   if (shape->rows <= kLiteRtNvidiaInt4BlockGemvMaxRows) {
-    // Decode: the hidden kernel routes from the logits itself.
+    // Decode: the hidden kernel routes from the logits itself; rows grouped
+    // by expert, the grouped launch's prologue.
     return cudaSuccess;
   }
   constexpr int kRouteWarps = 4;
@@ -1213,9 +1924,11 @@ cudaError_t LaunchFusedRouting(const LiteRtNvidiaMoeShape* shape,
   return cudaPeekAtLastError();
 }
 
-// The logits the hidden kernel routes from in decode; prefill routed already.
+// The logits a few rows' launch routes from (the hidden kernel in decode,
+// the prologue of rows grouped by expert); prefill rows are routed already.
 const __nv_bfloat16* DecodeRoutingLogits(const LiteRtNvidiaMoeShape& shape,
                                          const char* logits) {
+  using namespace litert::nvidia::int4_block;
   return shape.rows <= kLiteRtNvidiaInt4BlockGemvMaxRows
              ? reinterpret_cast<const __nv_bfloat16*>(logits)
              : nullptr;
@@ -1362,7 +2075,7 @@ extern "C" cudaError_t LiteRtNvidiaLaunchBf16Int4BlockGemvRowsNormed(
   if (activation == nullptr || packed_weights == nullptr ||
       scales == nullptr || output == nullptr || rows <= 0 ||
       rows > kLiteRtNvidiaInt4BlockGemvMaxRows || input_size <= 0 ||
-      input_size % kBlock != 0 || output_size <= 0 || gate < 0 || gate > 2 ||
+      input_size % kBlock != 0 || output_size <= 0 || gate < 0 || gate > 3 ||
       (norm_scale != nullptr && norm_eps < 0.0f)) {
     return cudaErrorInvalidValue;
   }
@@ -1370,26 +2083,12 @@ extern "C" cudaError_t LiteRtNvidiaLaunchBf16Int4BlockGemvRowsNormed(
   const auto* typed_scales = static_cast<const __half*>(scales);
   auto* typed_output = static_cast<__nv_bfloat16*>(output);
   const DenseNorm norm = {norm_scale, norm_eps, norm_multiplier};
-  // As many warps as the input blocks fill, up to four: 22 blocks (an
-  // expert's down projection) one warp, 66 (the dense down projection)
-  // three, 88 and more four.
-  const int blocks = input_size / kBlock;
-  if (blocks <= 32) {
-    return LaunchDenseRows<32>(typed_activation, packed_weights, typed_scales,
-                               norm, typed_output, rows, input_size,
-                               output_size, gate, stream);
+  if (rows >= 2) {
+    return LaunchDenseMma(typed_activation, packed_weights, typed_scales, norm,
+                          typed_output, rows, input_size, output_size, gate,
+                          stream);
   }
-  if (blocks <= 64) {
-    return LaunchDenseRows<64>(typed_activation, packed_weights, typed_scales,
-                               norm, typed_output, rows, input_size,
-                               output_size, gate, stream);
-  }
-  if (blocks <= 96) {
-    return LaunchDenseRows<96>(typed_activation, packed_weights, typed_scales,
-                               norm, typed_output, rows, input_size,
-                               output_size, gate, stream);
-  }
-  return LaunchDenseRows<128>(typed_activation, packed_weights, typed_scales,
-                              norm, typed_output, rows, input_size,
-                              output_size, gate, stream);
+  return LaunchDenseFp32(typed_activation, packed_weights, typed_scales, norm,
+                         typed_output, rows, input_size, output_size, gate,
+                         stream);
 }

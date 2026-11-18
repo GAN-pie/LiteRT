@@ -113,17 +113,23 @@ class AtsInferenceTest : public RngTest {
 
   void TestBody() override {
     auto device = this->TracedDevice(conf_.DataSeed());
-    LITERT_ASSERT_OK_AND_ASSIGN(exec_, MakeExecutor());
     LITERT_ASSERT_OK_AND_ASSIGN(auto inputs, MakeInputs(device));
 
-    const int num_warmup = conf_.WarmupRuns();
-    for (int w = 0; w < num_warmup; ++w) {
-      LITERT_ASSERT_OK(exec_->Run(inputs));
-    }
-
     VarBuffers actual;
-    for (auto _ : this->FuzzBlock(conf_.ItersPerTest(), conf_.MaxMsPerTest())) {
-      LITERT_ASSERT_OK_AND_ASSIGN(actual, Actual(inputs, exec_.get()));
+    {
+      LITERT_ASSERT_OK_AND_ASSIGN(auto exec, MakeExecutor());
+      const int num_warmup = conf_.WarmupRuns();
+      for (int w = 0; w < num_warmup; ++w) {
+        LITERT_ASSERT_OK(exec->Run(inputs));
+      }
+
+      for (auto _ :
+           this->FuzzBlock(conf_.ItersPerTest(), conf_.MaxMsPerTest())) {
+        LITERT_ASSERT_OK_AND_ASSIGN(actual, Actual(inputs, exec.get()));
+      }
+      if (auto metrics = exec->GetMetrics(); metrics.HasValue()) {
+        cap_.memory.SetFields(*metrics);
+      }
     }
 
     LITERT_ASSERT_OK_AND_ASSIGN(auto ref, Reference(inputs));
@@ -132,15 +138,11 @@ class AtsInferenceTest : public RngTest {
 
   void TearDown() override {
     cap_.accelerator.SetFields(conf_);
-    if (exec_) {
-      if (auto metrics = exec_->GetMetrics(); metrics.HasValue()) {
-        cap_.memory.SetFields(*metrics);
-      }
-    }
 
-    if (conf_.IsNpu() && !cap_.accelerator.soc_man.empty() &&
-        graph_->IsLoaded()) {
-      auto stamp = GetBuildStamp(Graph());
+    if (conf_.IsNpu() && (aot_model_ != nullptr || graph_->IsLoaded())) {
+      const LiteRtModelT& target_graph =
+          aot_model_ != nullptr ? *aot_model_ : Graph();
+      auto stamp = GetBuildStamp(target_graph);
       if (stamp) {
         cap_.accelerator.soc_man = std::string(stamp->soc_manufacturer);
         cap_.accelerator.soc_model = std::string(stamp->soc_model);
@@ -177,8 +179,15 @@ class AtsInferenceTest : public RngTest {
     LITERT_RETURN_IF_ERROR(graph_->ConfigureOptions(options));
 
     if (conf_.IsNpu()) {
-      auto exec = NpuCompiledModelExecutor::Create(Graph(), options, env);
-      cap_.compilation.SetFields(conf_, Graph(), !exec.HasValue());
+      LiteRtModelT* target_graph = &Graph();
+      if (!conf_.AotModelsDir().empty()) {
+        LITERT_ASSIGN_OR_RETURN(aot_model_,
+                                conf_.LoadAotModel(names_.report_id));
+        target_graph = aot_model_.get();
+        cap_.model.SetFields(names_, *target_graph);
+      }
+      auto exec = NpuCompiledModelExecutor::Create(*target_graph, options, env);
+      cap_.compilation.SetFields(conf_, *target_graph, !exec.HasValue());
       if (!exec) {
         return exec.Error();
       }
@@ -211,7 +220,7 @@ class AtsInferenceTest : public RngTest {
     return exec->Run(inputs, cap_.latency);
   }
 
-  Expected<VarBuffers> Reference(const VarBuffers& inputs) {
+  Expected<VarBuffers> Reference(const VarBuffers& inputs) const {
     return graph_->HasReference() ? CustomReference(inputs)
                                   : CpuReference(inputs);
   }
@@ -222,16 +231,12 @@ class AtsInferenceTest : public RngTest {
     return outputs;
   }
 
-  Expected<VarBuffers> CpuReference(const VarBuffers& inputs) {
-    if (!cpu_ref_exec_) {
-      LITERT_ASSIGN_OR_RETURN(
-          auto exec,
-          CpuCompiledModelExecutor::Create(Graph(), conf_.ReferenceOptions(),
-                                           conf_.GetEnvironment()));
-      cpu_ref_exec_ =
-          std::make_unique<CpuCompiledModelExecutor>(std::move(exec));
-    }
-    return cpu_ref_exec_->Run(inputs);
+  Expected<VarBuffers> CpuReference(const VarBuffers& inputs) const {
+    LITERT_ASSIGN_OR_RETURN(
+        auto exec,
+        CpuCompiledModelExecutor::Create(Graph(), conf_.ReferenceOptions(),
+                                         conf_.GetEnvironment()));
+    return exec.Run(inputs);
   }
 
   Expected<VarBuffers> MakeOutputs() const {
@@ -494,11 +499,10 @@ class AtsInferenceTest : public RngTest {
       : graph_(std::move(graph)), conf_(conf), names_(names), cap_(cap) {}
 
   TestGraph::Ptr graph_;
+  LiteRtModelT::Ptr aot_model_ = nullptr;
   const AtsConf& conf_;
   TestNames names_;
   Capture::Entry& cap_;
-  CompiledModelExecutor::Ptr exec_ = nullptr;
-  CompiledModelExecutor::Ptr cpu_ref_exec_ = nullptr;
   bool has_failure_ = false;
 };
 

@@ -68,6 +68,39 @@ TEST(SdpaTransposedSupportTest, AdrenoOpenClProcessesAtMostTwoHeadsPerGroup) {
   }
 }
 
+TEST(SdpaTransposedSupportTest, AdrenoOpenClScoresAtMostTwoKeysPerWorkItem) {
+  // With 2 heads per work group and 4 keys per work item the Adreno 830
+  // compiler limits the kernel to 192 work items, fewer than the 256 it is
+  // launched with, so tuning finds no dispatch for 8K+ caches.
+  const ::ml_drift::GpuInfo gpu_info =
+      OpenClGpuInfo(::ml_drift::GpuVendor::kQualcomm);
+  const FlashDecodeTuning tuning = GetFlashDecodeTuning(gpu_info);
+  EXPECT_EQ(tuning.max_keys_per_thread, 2);
+  EXPECT_EQ(MaxFlashDecodeKeysPerThread(tuning, /*heads=*/1), 2);
+  EXPECT_EQ(MaxFlashDecodeKeysPerThread(tuning, /*heads=*/2), 2);
+
+  for (const int cache_size : {8192, 16896, 32768}) {
+    const ::ml_drift::BHWC q_shape = QueryShape(/*head_dim=*/256);
+    const ::ml_drift::BHWC k_shape = CacheShape(cache_size, 256);
+    const FlashDecodeConfig config =
+        GetFlashDecodeConfig(gpu_info, q_shape, k_shape);
+    EXPECT_EQ(MaxFlashDecodeKeysPerThread(config.tuning, config.heads), 2)
+        << "cache_size=" << cache_size;
+    EXPECT_TRUE(IsSupportedFlashSdpaShape(gpu_info, q_shape, k_shape))
+        << "cache_size=" << cache_size;
+  }
+}
+
+TEST(SdpaTransposedSupportTest, OtherOpenClGpusScoreUpToFourKeysPerWorkItem) {
+  const ::ml_drift::GpuInfo gpu_info =
+      OpenClGpuInfo(::ml_drift::GpuVendor::kMali);
+  const FlashDecodeTuning tuning = GetFlashDecodeTuning(gpu_info);
+  EXPECT_EQ(tuning.max_keys_per_thread, 4);
+  EXPECT_EQ(MaxFlashDecodeKeysPerThread(tuning, /*heads=*/2), 4);
+  // The probabilities of a chunk stay within 8 KB of local memory.
+  EXPECT_EQ(MaxFlashDecodeKeysPerThread(tuning, /*heads=*/4), 2);
+}
+
 TEST(SdpaTransposedSupportTest, OtherOpenClGpusProcessTheWholeGqaGroup) {
   const ::ml_drift::GpuInfo gpu_info =
       OpenClGpuInfo(::ml_drift::GpuVendor::kMali);
@@ -91,6 +124,7 @@ TEST(SdpaTransposedSupportTest, ThreadsAreClampedToTheDeviceLimit) {
   ::ml_drift::GpuInfo gpu_info;
   gpu_info.vendor = ::ml_drift::GpuVendor::kApple;
   gpu_info.gpu_api = ::ml_drift::GpuApi::kMetal;
+  gpu_info.apple_info = ::ml_drift::AppleInfo("apple m4 pro");
   gpu_info.supported_wave_sizes = {32};
   return gpu_info;
 }
@@ -101,19 +135,50 @@ TEST(SdpaTransposedSupportTest, AppleMetalUsesTheSimdWorkGroupKernel) {
   EXPECT_TRUE(tuning.simd_work_group);
   EXPECT_EQ(tuning.max_heads_per_work_group, 4);
   EXPECT_EQ(tuning.lanes_per_key, 4);
+  EXPECT_EQ(tuning.target_work_groups, 40);
 
   // Gemma 4 26B-A4B global attention: 16 query heads share 2 K/V heads of head
-  // dim 512 in a 32K cache. 4 heads per work group and 10 splits give 40 work
-  // groups.
+  // dim 512. At a 4K cache (16 MiB of K/V), 4 heads per work group, 4 lanes per
+  // key and 10 splits give 40 work groups.
   const ::ml_drift::BHWC q_shape(1, 16, 1, 512);
-  const ::ml_drift::BHWC k_shape(1, 2, 32768, 512);
-  const FlashDecodeConfig config =
-      GetFlashDecodeConfig(gpu_info, q_shape, k_shape);
-  EXPECT_FALSE(config.use_wave_simd);
-  EXPECT_TRUE(config.tuning.simd_work_group);
-  EXPECT_EQ(config.heads, 4);
-  EXPECT_EQ(config.splits, 10);
-  EXPECT_TRUE(IsSupportedFlashSdpaShape(gpu_info, q_shape, k_shape));
+  const FlashDecodeConfig short_config = GetFlashDecodeConfig(
+      gpu_info, q_shape, ::ml_drift::BHWC(1, 2, 4096, 512));
+  EXPECT_FALSE(short_config.use_wave_simd);
+  EXPECT_TRUE(short_config.tuning.simd_work_group);
+  EXPECT_EQ(short_config.heads, 4);
+  EXPECT_EQ(short_config.tuning.lanes_per_key, 4);
+  EXPECT_EQ(short_config.splits, 10);
+  EXPECT_TRUE(IsSupportedFlashSdpaShape(gpu_info, q_shape,
+                                        ::ml_drift::BHWC(1, 2, 4096, 512)));
+
+  // At 32K and 64K caches (>= 32 MiB of K/V), all 8 GQA heads share one work
+  // group with one lane per key so the K/V cache is read from DRAM once; 20
+  // splits keep 40 work groups on the 20-core M4 Pro.
+  for (const int cache_size : {32768, 65536}) {
+    const ::ml_drift::BHWC k_shape(1, 2, cache_size, 512);
+    const FlashDecodeConfig long_config =
+        GetFlashDecodeConfig(gpu_info, q_shape, k_shape);
+    EXPECT_FALSE(long_config.use_wave_simd) << "cache_size=" << cache_size;
+    EXPECT_TRUE(long_config.tuning.simd_work_group)
+        << "cache_size=" << cache_size;
+    EXPECT_EQ(long_config.heads, 8) << "cache_size=" << cache_size;
+    EXPECT_EQ(long_config.tuning.lanes_per_key, 1)
+        << "cache_size=" << cache_size;
+    EXPECT_EQ(long_config.splits, 20) << "cache_size=" << cache_size;
+    EXPECT_TRUE(IsSupportedFlashSdpaShape(gpu_info, q_shape, k_shape))
+        << "cache_size=" << cache_size;
+  }
+
+  // On a 40-core Apple M5 Max, `target_work_groups` scales to 80 (2 work groups
+  // per GPU core), giving 40 splits across the 2 head groups at 32K and 64K.
+  ::ml_drift::GpuInfo m5_max = gpu_info;
+  m5_max.apple_info = ::ml_drift::AppleInfo("apple m5 max");
+  EXPECT_EQ(GetFlashDecodeTuning(m5_max).target_work_groups, 80);
+  const FlashDecodeConfig m5_max_64k = GetFlashDecodeConfig(
+      m5_max, q_shape, ::ml_drift::BHWC(1, 2, 65536, 512));
+  EXPECT_EQ(m5_max_64k.heads, 8);
+  EXPECT_EQ(m5_max_64k.tuning.lanes_per_key, 1);
+  EXPECT_EQ(m5_max_64k.splits, 40);
 
   // Head dim 128 keeps the wave-SIMD kernel.
   EXPECT_TRUE(GetFlashDecodeConfig(gpu_info, ::ml_drift::BHWC(1, 16, 1, 128),
@@ -135,20 +200,127 @@ TEST(SdpaTransposedSupportTest, SimdWorkGroupSplitsKeysAcrossDividingLanes) {
 TEST(SdpaTransposedSupportTest, SimdWorkGroupLocalMemoryBytes) {
   FlashDecodeTuning tuning = GetFlashDecodeTuning(AppleMetalGpuInfo());
   ASSERT_EQ(tuning.threads, 256);
-  // 4 heads of head dim 512: half query slices (4 * 128 * 8 B), the scores of
-  // 256 keys (4 * 256 * 4 B) and 2 * 4 * 8 SIMD-group values. The output
+  // 4 heads of head dim 512: float4 query slices (4 * 128 * 16 B), the scores
+  // of 256 keys (4 * 256 * 4 B) and 2 * 4 * 8 SIMD-group values. The output
   // accumulators reuse the score buffer.
   EXPECT_TRUE(SimdWorkGroupAccumulatorsReuseScores(4));
   EXPECT_EQ(FlashDecodeLocalMemoryBytes(tuning, /*heads=*/4, /*slices=*/128),
-            4096 + 4096 + 256);
+            8192 + 4096 + 256);
   // 2 heads of head dim 256 need separate float4 accumulators (256 * 16 B).
   EXPECT_FALSE(SimdWorkGroupAccumulatorsReuseScores(2));
   EXPECT_EQ(FlashDecodeLocalMemoryBytes(tuning, /*heads=*/2, /*slices=*/64),
-            1024 + 2048 + 128 + 4096);
+            2048 + 2048 + 128 + 4096);
   // The portable kernel needs 25,088 B for the first config.
   tuning.simd_work_group = false;
   EXPECT_EQ(FlashDecodeLocalMemoryBytes(tuning, /*heads=*/4, /*slices=*/128),
             25088);
+}
+
+TEST(SdpaTransposedSupportTest,
+     MetalWave32UsesWaveSimdForHeadDims64To256AndNonDividingUpTo512) {
+  ::ml_drift::GpuInfo gpu_info = AppleMetalGpuInfo();
+  gpu_info.apple_info = ::ml_drift::AppleInfo("apple m4 pro");
+  gpu_info.metal_info.language_version =
+      ::ml_drift::MetalLanguageVersion::kMetal3_0;
+  gpu_info.metal_info.max_work_group_size_x = 1024;
+  gpu_info.metal_info.max_work_group_size_y = 1024;
+  gpu_info.metal_info.max_work_group_size_z = 1024;
+
+  for (int head_dim : {64, 96, 128, 192, 256, 384}) {
+    const ::ml_drift::BHWC q_shape = QueryShape(head_dim);
+    const ::ml_drift::BHWC k_shape = CacheShape(/*cache_size=*/1024, head_dim);
+    const FlashDecodeConfig config =
+        GetFlashDecodeConfig(gpu_info, q_shape, k_shape);
+    const int expected_heads = head_dim <= 128 ? 4 : (head_dim <= 256 ? 2 : 1);
+    EXPECT_TRUE(config.use_wave_simd) << "head_dim=" << head_dim;
+    EXPECT_EQ(config.heads, expected_heads) << "head_dim=" << head_dim;
+    EXPECT_GE(config.splits, 1) << "head_dim=" << head_dim;
+    EXPECT_TRUE(IsSupportedFlashSdpaShape(gpu_info, q_shape, k_shape))
+        << "head_dim=" << head_dim;
+  }
+
+  // Head dim 512 (128 slices, divides 256 threads) stays on the 4-head SIMD
+  // work-group kernel.
+  const FlashDecodeConfig hd512 = GetFlashDecodeConfig(
+      gpu_info, QueryShape(/*head_dim=*/512), CacheShape(1024, 512));
+  EXPECT_FALSE(hd512.use_wave_simd);
+  EXPECT_TRUE(hd512.tuning.simd_work_group);
+}
+
+TEST(SdpaTransposedSupportTest,
+     MetalWave32GroupsGqaHeadsAndSplitsAcrossComputeUnits) {
+  ::ml_drift::GpuInfo gpu_info;
+  gpu_info.vendor = ::ml_drift::GpuVendor::kApple;
+  gpu_info.gpu_api = ::ml_drift::GpuApi::kMetal;
+  gpu_info.apple_info = ::ml_drift::AppleInfo("apple m4 pro");
+  gpu_info.supported_wave_sizes = {32};
+  gpu_info.metal_info.language_version =
+      ::ml_drift::MetalLanguageVersion::kMetal3_0;
+  gpu_info.metal_info.max_work_group_size_x = 1024;
+  gpu_info.metal_info.max_work_group_size_y = 1024;
+  gpu_info.metal_info.max_work_group_size_z = 1024;
+
+  // Qwen3.5-0.8B decode: 8 query heads sharing 2 K/V heads (GQA group 4) at
+  // head dim 256 on 20-core M4 Pro -> 2 heads/WG (4 head groups) x 5 splits =
+  // 20 work groups with 8 SIMD groups each.
+  const FlashDecodeConfig qwen35_1k = GetFlashDecodeConfig(
+      gpu_info, QueryShape(/*head_dim=*/256), CacheShape(1280, 256));
+  EXPECT_TRUE(qwen35_1k.use_wave_simd);
+  EXPECT_EQ(qwen35_1k.heads, 2);
+  EXPECT_EQ(qwen35_1k.splits, 5);
+  EXPECT_EQ(qwen35_1k.tuning.num_simd_groups, 8);
+
+  // At head dim 128 (1 slice per lane), all 4 GQA heads share one work group
+  // (2 head groups x 5 splits at 1280 cache, or 10 splits at 2560 cache).
+  const FlashDecodeConfig hd128_2k = GetFlashDecodeConfig(
+      gpu_info, QueryShape(/*head_dim=*/128), CacheShape(2560, 128));
+  EXPECT_TRUE(hd128_2k.use_wave_simd);
+  EXPECT_EQ(hd128_2k.heads, 4);
+  EXPECT_EQ(hd128_2k.splits, 10);
+  EXPECT_EQ(hd128_2k.tuning.num_simd_groups, 8);
+
+  // Small caches (< 256 keys) keep a single split.
+  const FlashDecodeConfig small_cache = GetFlashDecodeConfig(
+      gpu_info, QueryShape(/*head_dim=*/256), CacheShape(64, 256));
+  EXPECT_TRUE(small_cache.use_wave_simd);
+  EXPECT_EQ(small_cache.heads, 2);
+  EXPECT_EQ(small_cache.splits, 1);
+}
+
+TEST(SdpaTransposedSupportTest,
+     MetalWave32KeepsOneHeadPerWorkGroupWhenQueryHeadsFillTheGpu) {
+  ::ml_drift::GpuInfo gpu_info;
+  gpu_info.vendor = ::ml_drift::GpuVendor::kApple;
+  gpu_info.gpu_api = ::ml_drift::GpuApi::kMetal;
+  gpu_info.apple_info = ::ml_drift::AppleInfo("apple m4 pro");
+  gpu_info.supported_wave_sizes = {32};
+  gpu_info.metal_info.language_version =
+      ::ml_drift::MetalLanguageVersion::kMetal3_0;
+  gpu_info.metal_info.max_work_group_size_x = 1024;
+  gpu_info.metal_info.max_work_group_size_y = 1024;
+  gpu_info.metal_info.max_work_group_size_z = 1024;
+
+  // Qwen3-0.6B / Qwen3-4B decode: 16 or 32 query heads (GQA group 2 or 4) at
+  // head dim 128 already fill the 20 cores of M4 Pro with one query head per
+  // work group.
+  for (const auto& [q_heads, kv_heads] : {std::pair{16, 8}, std::pair{32, 8}}) {
+    const FlashDecodeConfig qwen3 =
+        GetFlashDecodeConfig(gpu_info, ::ml_drift::BHWC(1, q_heads, 1, 128),
+                             ::ml_drift::BHWC(1, kv_heads, 2560, 128));
+    EXPECT_TRUE(qwen3.use_wave_simd) << "q_heads=" << q_heads;
+    EXPECT_EQ(qwen3.heads, 1) << "q_heads=" << q_heads;
+    EXPECT_EQ(qwen3.splits, 1) << "q_heads=" << q_heads;
+    EXPECT_EQ(qwen3.tuning.num_simd_groups, 16) << "q_heads=" << q_heads;
+  }
+
+  // Qwen3.5-0.8B (8 query heads) fills a 10-core M4.
+  gpu_info.apple_info = ::ml_drift::AppleInfo("apple m4");
+  const FlashDecodeConfig qwen35_m4 = GetFlashDecodeConfig(
+      gpu_info, QueryShape(/*head_dim=*/256), CacheShape(1280, 256));
+  EXPECT_TRUE(qwen35_m4.use_wave_simd);
+  EXPECT_EQ(qwen35_m4.heads, 1);
+  EXPECT_EQ(qwen35_m4.splits, 1);
+  EXPECT_EQ(qwen35_m4.tuning.num_simd_groups, 16);
 }
 
 }  // namespace

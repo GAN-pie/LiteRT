@@ -392,9 +392,12 @@ litert_dispatch_api(
         "//litert/vendors/nvidia:windows_compat",
         "//litert/vendors/nvidia/compiler:cache_update_plugin",
         "//litert/vendors/nvidia/compiler:decode_attention_plugin",
+        "//litert/vendors/nvidia/compiler:gated_delta_plugin",
         "//litert/vendors/nvidia/compiler:int8_cache_write_plugin",
         "//litert/vendors/nvidia/compiler:moe_plugin",
         "//litert/vendors/nvidia/compiler:qkv_norm_rope_plugin",
+        "//litert/vendors/nvidia/compiler:quant_attention_plugin",
+        "//litert/vendors/nvidia/compiler:quant_linear_plugin",
         "//litert/vendors/nvidia/compiler:subbyte_gemv_plugin",
         "//litert/vendors/nvidia/trtllm:gemma4_head_kernels",
         "@local_cuda//:cuda_headers",
@@ -431,6 +434,46 @@ cc_test(
 )
 
 cc_test(
+    name = "quant_cache_dispatch_test",
+    srcs = ["quant_cache_dispatch_test.cc"],
+    env = {
+        "LITERT_NVIDIA_TENSORRT_FP16_ACTIVATIONS": "1",
+        "LITERT_NVIDIA_TENSORRT_SHARED_WEIGHTS": "0",
+    },
+    tags = [
+        "exclusive",
+        "manual",
+        "requires-gpu",
+    ],
+    target_compatible_with = select({
+        "//litert:linux_x86_64": [],
+        "//litert:windows": [],
+        "//litert:linux_aarch64": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":dispatch_api",
+        "//litert/c:litert_common",
+        "//litert/c:litert_model_types",
+        "//litert/c:litert_tensor_buffer_requirements",
+        "//litert/c/internal:litert_compiler_context",
+        "//litert/c/internal:litert_runtime_context_header",
+        "//litert/compiler/cc:litert_model",
+        "//litert/core/util:tensor_type_util",
+        "//litert/vendors/c:litert_dispatch_c_api",
+        "//litert/vendors/nvidia:bytecode",
+        "//litert/vendors/nvidia/compiler:quant_attention_test_graph",
+        "//litert/vendors/nvidia/compiler:tensorrt_graph_builder",
+        "//litert/vendors/nvidia/trtllm:quant_attention_reference",
+        "@com_google_googletest//:gtest_main",
+        "@local_cuda//:cuda_headers",
+        "@local_cuda//:cuda_runtime",
+        "@local_tensorrt_rtx//:tensorrt_rtx_headers",
+        "@local_tensorrt_rtx//:tensorrt_rtx_stub",
+    ],
+)
+
+cc_test(
     name = "aot_engine_residency_test",
     srcs = ["aot_engine_residency_test.cc"],
     tags = [
@@ -446,6 +489,7 @@ cc_test(
     }),
     deps = [
         ":dispatch_api",
+        ":token_table_c_api",
         "//litert/c:litert_common",
         "//litert/c:litert_custom_tensor_buffer",
         "//litert/c:litert_model_types",

@@ -20,10 +20,11 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"  // from @com_google_absl
+#include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/container/flat_hash_set.h"  // from @com_google_absl
 #include "absl/log/absl_check.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
@@ -94,7 +95,7 @@ TensorType MakeRankedTensorType(LiteRtElementType element_type,
   ranked.element_type = element_type;
   ABSL_DCHECK_LE(dims.size(), LITERT_TENSOR_MAX_RANK);
   ranked.layout.rank = dims.size();
-  std::copy(dims.begin(), dims.end(), ranked.layout.dimensions);
+  absl::c_copy(dims, ranked.layout.dimensions);
   // Strides not yet supported.
   ranked.layout.has_strides = false;
   return tensor_type;
@@ -161,7 +162,7 @@ LiteRtSignatureT MakeDefaultSignature(LiteRtSubgraph subgraph) {
   }
 
   const auto subgraphs = model.Subgraphs();
-  std::unordered_map<const LiteRtSubgraphT*, size_t> subgraph_indices;
+  absl::flat_hash_map<const LiteRtSubgraphT*, size_t> subgraph_indices;
   subgraph_indices.reserve(subgraphs.size());
   for (size_t i = 0; i < subgraphs.size(); ++i) {
     subgraph_indices.emplace(subgraphs[i], i);
@@ -690,7 +691,14 @@ bool IsConstant(const LiteRtTensorT& tensor) {
       is_zero_sized = true;
     }
   }
-  const auto is_const = tensor.Weights().Buffer().Size() > 0 || is_zero_sized;
+  bool is_external = false;
+  if (auto ctx = tensor.Weights().GetBufferManager()->GetContext(
+          tensor.Weights().GetBufferId());
+      ctx && ctx->get().external.has_value()) {
+    is_external = true;
+  }
+  const auto is_const =
+      tensor.Weights().Buffer().Size() > 0 || is_zero_sized || is_external;
   ABSL_DCHECK(!is_const || tensor.DefiningOp() == nullptr)
       << "Constant tensors should not be defined by an op";
   return is_const;
@@ -800,6 +808,11 @@ bool DCE(LiteRtSubgraphT& subgraph) {
 
   absl::flat_hash_set<const LiteRtTensorT*> referenced_tensors;
   for (const auto* tensor : subgraph.Tensors()) {
+    // A tensor this pass removes keeps nothing alive: the scales of a dead
+    // blockwise-quantized constant go with it.
+    if (IsTensorDead(*tensor) && !IsIO(subgraph, *tensor)) {
+      continue;
+    }
     if (tensor->Qparams().first == kLiteRtQuantizationBlockWise) {
       const auto& block_wise = tensor->Qparams().second.block_wise;
       if (block_wise.scales) {

@@ -17,6 +17,9 @@
 load("@rules_cc//cc/common:cc_info.bzl", "CcInfo")
 load("@rules_platform//platform_data:defs.bzl", "platform_data")
 load("//litert/build_common:litert_build_defs.bzl", "absolute_label")
+load("//litert/build_common:ynnpack_platform_data.bzl", _windows_dlls = "windows_dlls")
+
+windows_dlls = _windows_dlls
 
 # DEVICE PATHS #####################################################################################
 
@@ -287,11 +290,14 @@ def _IntelOpenVinoSpec():
                 ("//litert/vendors/intel_openvino/compiler:libLiteRtCompilerPlugin_IntelOpenvino.so", "LD_LIBRARY_PATH"),
                 # copybara:uncomment_begin(oss openvino)
                 # ("@intel_openvino//:libopenvino_so", "LD_LIBRARY_PATH"),
+                # ("@intel_openvino//:libopenvino_ir_frontend_so", "LD_LIBRARY_PATH"),
                 # ("@intel_openvino//:libopenvino_tensorflow_lite_frontend_so", "LD_LIBRARY_PATH"),
                 # ("@intel_openvino//:libopenvino_intel_cpu_plugin_so", "LD_LIBRARY_PATH"),
                 # ("@intel_openvino//:libopenvino_intel_npu_plugin_so", "LD_LIBRARY_PATH"),
+                # ("@intel_openvino//:libtbb_so_file", "LD_LIBRARY_PATH"),
                 # copybara:uncomment_end_and_comment_begin
                 ("@intel_openvino//:openvino_android/runtime/lib/intel64/libopenvino.so", "LD_LIBRARY_PATH"),
+                ("@intel_openvino//:openvino_android/runtime/lib/intel64/libopenvino_ir_frontend.so", "LD_LIBRARY_PATH"),
                 ("@intel_openvino//:openvino_android/runtime/lib/intel64/libopenvino_tensorflow_lite_frontend.so", "LD_LIBRARY_PATH"),
                 ("@intel_openvino//:openvino_android/runtime/lib/intel64/libopenvino_intel_cpu_plugin.so", "LD_LIBRARY_PATH"),
                 ("@intel_openvino//:openvino_android/runtime/lib/intel64/libopenvino_intel_npu_plugin.so", "LD_LIBRARY_PATH"),
@@ -302,15 +308,20 @@ def _IntelOpenVinoSpec():
                 "device": "regex:ruby|moonstone|lapis",
                 "label": "litert-test-intel-ptl",
             }],
+            mh_user = "litert-eng-ptl-acl",
             dispatch = "libLiteRtDispatch_IntelOpenvino.so",
             plugin = "libLiteRtCompilerPlugin_IntelOpenvino.so",
             host_libs = [
                 # copybara:uncomment_begin(oss openvino)
-                # "@intel_openvino//:libopenvino_so",
-                # "@intel_openvino//:libopenvino_tensorflow_lite_frontend_so",
+                # "//third_party/openvino_npu_compiler:openvino_runtime",
                 # copybara:uncomment_end_and_comment_begin
                 "@intel_openvino//:openvino/runtime/lib/intel64/libopenvino.so",
+                "@intel_openvino//:openvino/runtime/lib/intel64/libopenvino_ir_frontend.so",
                 "@intel_openvino//:openvino/runtime/lib/intel64/libopenvino_tensorflow_lite_frontend.so",
+                "@intel_openvino//:openvino/runtime/lib/intel64/libopenvino_intel_cpu_plugin.so",
+                "@intel_openvino//:openvino/runtime/lib/intel64/libopenvino_intel_npu_plugin.so",
+                "@intel_openvino//:openvino/runtime/lib/intel64/libopenvino_intel_npu_compiler_loader.so",
+                "@intel_openvino//:openvino/runtime/lib/intel64/libopenvino_intel_npu_compiler.so",
                 # copybara:comment_end
             ],
         ),
@@ -418,12 +429,21 @@ def _GpuSpec(accelerator = "cl_gl", platform = "android"):
         ]
     elif accelerator == "webgpu":
         id = "webgpu"
-        libs = [
-            (
-                "//litert/runtime/accelerators/gpu:ml_drift_webgpu_accelerator_dylib" if platform == "macos" else "//litert/runtime/accelerators/gpu:ml_drift_webgpu_accelerator_so",
-                "DYLD_LIBRARY_PATH" if platform == "macos" else "LD_LIBRARY_PATH",
-            ),
-        ]
+        if platform == "macos":
+            libs = [
+                ("//litert/runtime/accelerators/gpu:ml_drift_webgpu_accelerator_dylib", "DYLD_LIBRARY_PATH"),
+            ]
+        elif platform == "windows":
+            libs = [
+                ("//litert/runtime/accelerators/gpu:ml_drift_webgpu_accelerator_dll", "PATH"),
+                # copybara:uncomment_begin(google-only)
+                # ("//third_party/odml/litert_lm/runtime/e2e_tests:dxc_dlls", "PATH"),
+                # copybara:uncomment_end
+            ]
+        else:
+            libs = [
+                ("//litert/runtime/accelerators/gpu:ml_drift_webgpu_accelerator_so", "LD_LIBRARY_PATH"),
+            ]
     else:
         fail("Unsupported GPU accelerator: {}".format(accelerator))
 
@@ -534,7 +554,12 @@ def split_dep_platform(
 
             # copybara:uncomment_begin(google-only)
             # # Prebuilt QAIRT host libraries require GLIBC >= 2.34 rather than GRTE v5 (glibc 2.27).
-            # host_platform = "//litert/integration_test:host_cots_linux" if "qualcomm" in backend_id else host_platform
+            # host_platform = (
+            # "//litert/integration_test:host_cots_linux" if "qualcomm" in backend_id else select({
+            # "//litert:linux_aarch64": "//litert/integration_test:host_arm64",
+            # "//conditions:default": host_platform,
+            # })
+            # )
             #
             # copybara:uncomment_end
             platform_data(

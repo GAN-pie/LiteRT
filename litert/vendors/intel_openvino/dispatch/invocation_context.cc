@@ -1,4 +1,4 @@
-// Copyright (C) 2025 Intel Corporation
+// Copyright (C) 2025-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,7 +35,9 @@
 #include <vector>
 
 #include "openvino/core/any.hpp"
+#include "openvino/core/except.hpp"  // NOLINT
 #include "openvino/runtime/compiled_model.hpp"
+#include "openvino/runtime/file_handle.hpp"
 #include "openvino/runtime/intel_npu/properties.hpp"  // NOLINT
 #include "openvino/runtime/properties.hpp"            // NOLINT
 #include "openvino/runtime/tensor.hpp"
@@ -58,12 +60,13 @@
 #include "litert/c/options/litert_intel_openvino_options.h"
 #include "litert/cc/litert_expected.h"
 #include "litert/cc/litert_macros.h"
-#include "litert/core/util/tensor_type_util.h"
+#include "litert/cc/litert_ranked_tensor_type.h"
 #include "litert/vendors/c/litert_dispatch.h"
 #include "litert/vendors/intel_openvino/bytecode_header.h"
 #include "litert/vendors/intel_openvino/compiler/global_graph.h"
 #include "litert/vendors/intel_openvino/dispatch/mapped_pages.h"
 #include "litert/vendors/intel_openvino/dispatch/weight_bank_runtime.h"
+#include "litert/vendors/intel_openvino/hfa_history.h"
 #include "litert/vendors/intel_openvino/openvino_version_info.h"
 #include "litert/vendors/intel_openvino/utils.h"
 
@@ -268,8 +271,11 @@ void LiteRtDispatchInvocationContextT::ReleaseImportedLocked() {
   // Dropping the infer request drops the last reference to this node's
   // ov::CompiledModel. bound_weights_ are views the request borrowed, so they
   // go with it. attached_inputs_/attached_outputs_ are kept on purpose.
+  hfa_history_.reset();
   infer_request_ = {};
   bound_weights_.clear();
+  // The next import creates a new compiled model at the default priority.
+  requested_model_priority_.reset();
   imported_ = false;
   LITERT_LOG(LITERT_INFO,
              "EVICT released imported model for '%s' (%zu byte payload); it "
@@ -358,9 +364,10 @@ litert::Expected<void> LiteRtDispatchInvocationContextT::ImportLocked() {
   // to the graph name; fall back to the sole subgraph). The subgraph's weights
   // are resolved against the pool at import below:
   //   - GPU: bound as views into a shared USM-host copy of the pool.
-  //   - NPU: the pool is staged to a temp file and handed to NPUW via
-  //     ov::weights_path; each Constant's WeightlessCacheAttribute bin_offset
-  //     resolves to mmap->data() + bin_offset.
+  //   - NPU: the pool is handed to NPUW as a file region -- the model file
+  //     itself when it is fd-backed, else a staged temp file -- and each
+  //     Constant's WeightlessCacheAttribute bin_offset resolves to
+  //     mmap->data() + bin_offset.
   // Non-shared models skip this and use the raw bytecode directly.
   // |global_graph| is kept at function scope (its spans alias
   // exec_bytecode_buffer, which outlives this function) so the GPU bank fill
@@ -504,9 +511,10 @@ litert::Expected<void> LiteRtDispatchInvocationContextT::ImportLocked() {
   // consumption strategies over one container format:
   //   - GPU: weights are Parameters imported plainly, then bound to views into
   //     a shared usm-host buffer (below).
-  //   - NPU: weights are Constants tagged with WeightlessCacheAttribute; the
-  //     pool is staged to a temp file and imported via ov::weights_path so NPUW
-  //     mmaps it and resolves each constant as mmap->data() + bin_offset.
+  //   - NPU: weights are Constants tagged with WeightlessCacheAttribute; NPUW
+  //     is pointed at the pool as a file region (the model file itself, or a
+  //     staged temp file) and mmaps it, resolving each constant as
+  //     mmap->data() + bin_offset.
   // A non-shared model (no container) imports its payload directly.
   const bool gpu_shared = has_container && device == "GPU";
   const bool npu_shared = has_container && device == "NPU";
@@ -550,16 +558,21 @@ litert::Expected<void> LiteRtDispatchInvocationContextT::ImportLocked() {
     ov::AnyMap import_properties = runtime_properties_;
 
     if (npu_shared) {
-      // Stage the deduplicated pool to a temp file once per model, then hand it
-      // to NPUW. The temp file is a byte-for-byte copy of the contiguous pool
-      // span, starting at byte 0, so bin_offset resolves directly. The bank is
-      // owned by this device context, i.e. by the CompiledModel, and shared by
-      // all of its partitions: one CompiledModel per model stages it once.
-      // When the model is file-backed (fd >= 0) the bank reads the pool
-      // through short-lived per-chunk mappings of the model file at the pool's
-      // absolute file offset, so the pool is never faulted into the model's
-      // long-lived mapping; otherwise it writes from the in-memory view (logged
-      // by the bank).
+      // Hand the deduplicated pool to NPUW. Two ways, preferred first:
+      //
+      //  1. Straight out of the model file: the bank gives NPUW a descriptor
+      //     seeked to the pool's offset, NPUW reads that position back and
+      //     maps [pool, EOF). Nothing is copied, nothing is written to disk,
+      //     and the pool is paged in by NPUW's own per-weight mappings.
+      //  2. Staged to a temp file via ov::weights_path, when (1) is not
+      //     possible -- a model loaded from memory, or Windows, where the
+      //     model fd belongs to another module's C runtime. The temp file is
+      //     a byte-for-byte copy of the pool starting at byte 0.
+      //
+      // Either way the mapping NPUW ends up with starts at the pool, so each
+      // Constant's pool-relative bin_offset resolves as data() + bin_offset.
+      // The bank is owned by this device context, i.e. by the CompiledModel,
+      // and shared by all of its partitions: it resolves once per model.
       litert::openvino::PoolSource pool_source;
       pool_source.data = pool_ptr;
       pool_source.size = pool_size;
@@ -572,23 +585,37 @@ litert::Expected<void> LiteRtDispatchInvocationContextT::ImportLocked() {
                 exec_bytecode_buffer->alloc_base_file_offset) +
             static_cast<uint64_t>(pool_ptr - buf_base);
       }
-      const std::string bank_path =
-          device_context_.NpuBank().EnsureOnDisk(pool_source);
-      if (bank_path.empty()) {
-        return litert::Error(
-            kLiteRtStatusErrorRuntimeFailure,
-            "Failed to stage shared weights bank to a temp file");
-      }
       // NPU_USE_NPUW is required or the plain NPU plugin rejects the NPUW blob;
-      // WEIGHTS_PATH + ENABLE_WEIGHTLESS are required or NPUW asserts "Blob is
-      // weightless but no WEIGHTS_PATH nor MODEL_PTR property is provided!".
+      // a weight source (handle provider or WEIGHTS_PATH) + ENABLE_WEIGHTLESS
+      // are required or NPUW asserts "Blob is weightless but no WEIGHTS_PATH
+      // nor MODEL_PTR property is provided!".
       import_properties["NPU_USE_NPUW"] = std::string("YES");
-      import_properties[ov::weights_path.name()] = bank_path;
       import_properties[ov::enable_weightless.name()] = true;
-      LITERT_LOG(LITERT_INFO,
-                 "GlobalGraph: importing weightless NPU blob with "
-                 "WEIGHTS_PATH='%s' (%zu byte pool)",
-                 bank_path.c_str(), pool_size);
+      ov::FileHandleProvider handle_provider =
+          device_context_.NpuBank().MakeHandleProvider(pool_source);
+      if (handle_provider) {
+        // Set by literal key: npuw_private_properties.hpp is not shipped in
+        // the OpenVINO runtime SDK.
+        import_properties["NPUW_WEIGHTS_HANDLE_PROVIDER"] =
+            std::move(handle_provider);
+        LITERT_LOG(LITERT_INFO,
+                   "GlobalGraph: importing weightless NPU blob with the pool "
+                   "(%zu bytes) mapped in place from the model file",
+                   pool_size);
+      } else {
+        const std::string bank_path =
+            device_context_.NpuBank().EnsureOnDisk(pool_source);
+        if (bank_path.empty()) {
+          return litert::Error(
+              kLiteRtStatusErrorRuntimeFailure,
+              "Failed to stage shared weights bank to a temp file");
+        }
+        import_properties[ov::weights_path.name()] = bank_path;
+        LITERT_LOG(LITERT_INFO,
+                   "GlobalGraph: importing weightless NPU blob with "
+                   "WEIGHTS_PATH='%s' (%zu byte pool)",
+                   bank_path.c_str(), pool_size);
+      }
       compiled_model =
           core->import_model(model_stream, device, import_properties);
     } else {
@@ -603,6 +630,9 @@ litert::Expected<void> LiteRtDispatchInvocationContextT::ImportLocked() {
                                                      exec_bytecode_size);
 
   infer_request_ = compiled_model.create_infer_request();
+  hfa_history_ = litert::openvino::HfaHistoryReporter::Find(
+      compiled_model, infer_request_,
+      function_name_.empty() ? "<unnamed>" : function_name_);
 
   // Bind the shared weights onto the infer request and hold the views for its
   // lifetime (set_input_tensor does not take ownership). GPU only: NPU weights
@@ -645,12 +675,13 @@ LiteRtDispatchInvocationContextT::GetTensorBufferRequirements(
       // it's supported, we use DMA-BUF.
       kLiteRtTensorBufferTypeDmaBuf,
       kLiteRtTensorBufferTypeAhwb,
+      kLiteRtTensorBufferTypeHostMemory,
   };
 
   int num_supported_tensor_buffer_types =
       sizeof(supported_tensor_buffer_types) /
       sizeof(supported_tensor_buffer_types[0]);
-  auto buffer_size = litert::internal::GetNumPackedBytes(tensor_type);
+  auto buffer_size = litert::RankedTensorType(tensor_type).Bytes();
   if (!buffer_size) {
     return litert::Unexpected(buffer_size.Error());
   }
@@ -718,16 +749,73 @@ litert::Expected<void> LiteRtDispatchInvocationContextT::BindOutput(
   return {};
 }
 
-struct ov_infer_request_wrapper {
-  std::shared_ptr<ov::InferRequest> object;
+#if defined(LITERT_INTEL_OPENVINO_NPU_HAL)
+namespace {
+
+// State shared with the NPU HAL hook's callbacks for one inference. The hook
+// calls back on the invoking thread; nothing OpenVINO crosses into it.
+struct GatedRun {
+  ov::InferRequest* request;
+  int timeout_ms;
+  // Set once the hook has called start. After that, a failure must not be
+  // retried by running the inference again.
+  bool started = false;
+  bool timed_out = false;
+  // OpenVINO exception message; exceptions must not cross the C callbacks.
+  std::optional<std::string> error;
 };
+
+void GatedStart(void* user) {
+  auto* run = static_cast<GatedRun*>(user);
+  run->started = true;
+  try {
+    run->request->start_async();
+  } catch (const std::exception& e) {
+    // `start` returns void, so the failure is reported through `wait`.
+    run->error = e.what();
+  } catch (...) {
+    run->error = "unknown exception";
+  }
+}
+
+// `timeout_ns` is the hook's optional deadline. The hook passes UINT64_MAX,
+// which its header defines as "no HAL-side deadline; the shim owns its own
+// timeout", so the dispatch's own limit (run->timeout_ms) applies. Honor the
+// smaller of the two if a hook ever passes a finite value.
+int GatedWait(void* user, uint64_t /*timeout_ns*/) {
+  auto* run = static_cast<GatedRun*>(user);
+  if (run->error.has_value()) return litert::openvino::kGatedWaitFailed;
+  try {
+    if (!run->request->wait_for(std::chrono::milliseconds(run->timeout_ms))) {
+      // Known limitation: the request is not cancelled (the Intel NPU plugin
+      // does not support cancel), so it may still be running. The hook reports
+      // the NPU HAL work as ended when this returns non-zero, and the next
+      // invoke gets ov::Busy until the device finishes.
+      run->timed_out = true;
+      return litert::openvino::kGatedWaitFailed;
+    }
+  } catch (const std::exception& e) {
+    run->error = e.what();
+    return litert::openvino::kGatedWaitFailed;
+  } catch (...) {
+    run->error = "unknown exception";
+    return litert::openvino::kGatedWaitFailed;
+  }
+  return litert::openvino::kGatedWaitOk;
+}
+
+}  // namespace
+#endif  // defined(LITERT_INTEL_OPENVINO_NPU_HAL)
 
 litert::Expected<void> LiteRtDispatchInvocationContextT::Invoke() {
   // Normally a no-op: AttachInput/AttachOutput already imported. Kept so a
   // graph with no attachable I/O still works.
   absl::ReaderMutexLock use(use_mutex_);
   LITERT_RETURN_IF_ERROR(EnsureImported());
-#if defined(__ANDROID__)
+  if (hfa_history_) {
+    LITERT_RETURN_IF_ERROR(hfa_history_->Update(infer_request_));
+  }
+#if defined(LITERT_INTEL_OPENVINO_NPU_HAL)
   const LiteRtSchedulingInfo* scheduling_info = GetSchedulingInfo();
   const bool has_job_priority =
       scheduling_info != nullptr &&
@@ -746,10 +834,7 @@ litert::Expected<void> LiteRtDispatchInvocationContextT::Invoke() {
   // Route every inference through the NPU HAL whenever the hook is present.
   // When the caller supplied no job priority, schedule at the default priority
   // instead of bypassing the HAL.
-  if (npu_hal_hooks.submit_inference_async != nullptr) {
-    const int32_t job_priority = has_job_priority
-                                     ? scheduling_info->job_priority
-                                     : litert::openvino::kDefaultJobPriority;
+  if (npu_hal_hooks.run_gated != nullptr) {
     const bool has_original_uid =
         scheduling_info != nullptr &&
         (scheduling_info->fields_mask & kLiteRtSchedulingInfoFieldOriginalUid);
@@ -757,47 +842,91 @@ litert::Expected<void> LiteRtDispatchInvocationContextT::Invoke() {
                                      ? scheduling_info->original_uid
                                      : static_cast<int32_t>(getuid());
 
-    // Best-effort: some OpenVINO/NPU driver versions expose MODEL_PRIORITY as
-    // read-only on a compiled model. If it can't be set, ignore and continue.
-    try {
-      auto compiled_model = infer_request_.get_compiled_model();
-      compiled_model.set_property(ov::hint::model_priority(
-          litert::openvino::ToOvModelPriority(job_priority)));
-    } catch (const std::exception& e) {
-      LITERT_LOG(LITERT_WARNING,
-                 "NPU HAL model priority not applied, ignoring: %s", e.what());
+    // Caller's own job priority, [0, 1000] with smaller values meaning higher
+    // priority. Reported to the HAL as-is.
+    const int32_t job_priority = has_job_priority
+                                     ? scheduling_info->job_priority
+                                     : litert::openvino::kDefaultJobPriority;
+    // The hook owns the priority model and maps the result to the OpenVINO
+    // hint.
+    const std::optional<ov::hint::Priority> ov_priority =
+        litert::openvino::ResolveOvModelPriority(job_priority, original_uid);
+    if (ov_priority.has_value() && ov_priority != requested_model_priority_) {
+      // Best-effort: a plugin that rejects the model-priority property must not
+      // fail the invoke.
+      try {
+        auto compiled_model = infer_request_.get_compiled_model();
+        compiled_model.set_property(ov::hint::model_priority(*ov_priority));
+        requested_model_priority_ = ov_priority;
+      } catch (const ov::Exception& e) {
+        // WORKAROUND for a C++ runtime mismatch across the library boundary.
+        // This library carries its own libc++, so its std::exception is a
+        // different type from the one OpenVINO's exceptions derive from, and
+        // the std::exception handler below misses them. ov::Exception is
+        // defined once, in libopenvino, so it matches. Remove this once the
+        // library and OpenVINO share one C++ runtime.
+        // OpenVINO before 26.5 does not implement this property on the NPUW
+        // compiled model: the priority is quietly ignored there.
+        LITERT_LOG(LITERT_WARNING,
+                   "NPU HAL model priority not applied, ignoring: %s",
+                   e.what());
+        // Remember it anyway so a failing plugin is not retried every inference.
+        requested_model_priority_ = ov_priority;
+      } catch (const std::exception& e) {
+        LITERT_LOG(LITERT_WARNING,
+                   "NPU HAL model priority not applied, ignoring: %s",
+                   e.what());
+        requested_model_priority_ = ov_priority;
+      }
     }
 
-    auto wrapper = std::make_unique<ov_infer_request_wrapper>();
-    wrapper->object = std::make_shared<ov::InferRequest>(infer_request_);
-    if (npu_hal_hooks.submit_inference_async(&ctx,
-                                             static_cast<void*>(wrapper.get()),
-                                             job_priority, original_uid) != 0) {
-      infer_request_ = {};
-      return litert::Unexpected(kLiteRtStatusErrorRuntimeFailure,
-                                "Inference submission rejected by NPU HAL");
-    }
-
-    // Block until the async NPU inference the HAL started has finished, then
-    // release the HAL context and the infer-request wrapper it borrowed. Per
-    // the HAL contract the wrapper (owned by unique_ptr, freed at scope exit)
-    // must outlive npu_hal_release_context().
-    const bool completed = infer_request_.wait_for(
-        std::chrono::milliseconds(kInferRequestTimeoutMs));
+    // `run` and `ops` live on this stack frame. The hook calls start and wait
+    // synchronously on this thread and does not use either one after
+    // run_gated returns; the context it hands back is released below.
+    GatedRun run{&infer_request_, kInferRequestTimeoutMs};
+    const npu_hal_infer_ops_t ops = {sizeof(npu_hal_infer_ops_t), &GatedStart,
+                                     &GatedWait, /*cancel=*/nullptr,
+                                     /*get_output=*/nullptr};
+    const int rc = npu_hal_hooks.run_gated(job_priority, original_uid, &ops,
+                                           &run, &ctx);
     if (ctx != nullptr) {
       if (npu_hal_hooks.release_context != nullptr) {
         npu_hal_hooks.release_context(ctx);
       }
       ctx = nullptr;
     }
-    if (!completed) {
+    // run_gated returns OK only after start has run and wait returned 0 (the
+    // inference is complete), so success needs no further check here.
+    if (rc == NPU_HAL_SUBMIT_OK) {
+      return {};
+    }
+    if (rc == NPU_HAL_SUBMIT_ACCESS_DENIED) {
+      // The HAL refused this app. Running the inference anyway would bypass
+      // the policy. The request was never started, so it is kept: the context
+      // is still marked imported, and a later invoke can be admitted.
+      return litert::Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                                "NPU HAL denied direct NPU access to this app");
+    }
+    if (run.started) {
+      // The inference started and then failed: do not run it again.
+      if (run.timed_out) {
+        return litert::Unexpected(
+            kLiteRtStatusErrorRuntimeFailure,
+            "Failed to execute inference request due to timeout");
+      }
       return litert::Unexpected(
           kLiteRtStatusErrorRuntimeFailure,
-          "Failed to execute inference request due to timeout");
+          run.error.has_value() ? *run.error
+                                : "NPU HAL inference failed after it started");
     }
-    return {};
+    // The HAL never started the inference (unreachable, or an error before
+    // admission): run it directly, as if the HAL were not there.
+    LITERT_LOG(LITERT_WARNING,
+               "NPU HAL not used (rc=%d), running without HAL notification",
+               rc);
+    // Falls through to the direct path below.
   }
-#endif
+#endif  // defined(LITERT_INTEL_OPENVINO_NPU_HAL)
   infer_request_.start_async();
   if (!infer_request_.wait_for(
           std::chrono::milliseconds(kInferRequestTimeoutMs)))
